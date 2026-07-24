@@ -1,0 +1,8 @@
+numpy
+tqdm
+pyyaml
+matplotlib
+einops
+
+[dev]
+pytest

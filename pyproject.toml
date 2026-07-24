@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "attention-free-transformer-repro"
+version = "0.1.0"
+description = "A learning-oriented PyTorch reproduction of An Attention Free Transformer."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "tqdm",
+    "pyyaml",
+    "matplotlib",
+    "einops",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+

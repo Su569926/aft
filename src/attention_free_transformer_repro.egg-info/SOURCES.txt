@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+src/aft/__init__.py
+src/aft/blocks.py
+src/aft/config.py
+src/aft/layers.py
+src/aft/model.py
+src/attention_free_transformer_repro.egg-info/PKG-INFO
+src/attention_free_transformer_repro.egg-info/SOURCES.txt
+src/attention_free_transformer_repro.egg-info/dependency_links.txt
+src/attention_free_transformer_repro.egg-info/requires.txt
+src/attention_free_transformer_repro.egg-info/top_level.txt
+tests/test_shapes.py
