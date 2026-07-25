@@ -16,6 +16,7 @@ class AFTBlock(nn.Module):
             max_seq_len=None,
             local_window_size=None,
             kernel_size=None,
+            causal=False,
     ):
         super().__init__()
 
@@ -34,7 +35,7 @@ class AFTBlock(nn.Module):
                 raise ValueError("max_seq_len must be provided when aft_type='local'")
             if local_window_size is None:
                 raise ValueError("local_window_size must be provided when aft_type='local'")
-            self.aft = AFTLocal(d_model, max_seq_len, local_window_size, dropout)
+            self.aft = AFTLocal(d_model, max_seq_len, local_window_size, dropout, causal)
         elif aft_type == "conv":
             if kernel_size is None:
                 raise ValueError("kernel_size must be provided when aft_type='conv'")

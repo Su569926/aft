@@ -90,7 +90,9 @@ class AFTFull(nn.Module):
         v = v.unsqueeze(1) # [B, 1, T, D]
         bias = bias.unsqueeze(0).unsqueeze(-1) # [1, T, T, 1]
 
-        scores = torch.exp(k + bias) #[B, T, T, D]，第一个T来源于目标位置t，第二个T来源于来源位置s
+        scores = k + bias  # [B, T, T, D]，第一个T来源于目标位置t，第二个T来源于来源位置s
+        scores = scores - scores.amax(dim=2, keepdim=True)
+        scores = torch.exp(scores)
 
         # 沿来源位置 s 求和，为每个目标位置 t 留下一个上下文向量。
         numerator = (scores * v).sum(dim=2)
@@ -105,7 +107,7 @@ class AFTFull(nn.Module):
 class AFTLocal(nn.Module):
     """AFT-local：在 AFT-full 的基础上屏蔽局部窗口外的位置。"""
 
-    def __init__(self, d_model, max_seq_len, local_window_size, dropout):
+    def __init__(self, d_model, max_seq_len, local_window_size, dropout, causal=False):
         super().__init__()
 
         self.to_q = nn.Linear(d_model, d_model)
@@ -115,6 +117,7 @@ class AFTLocal(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.position_bias = nn.Parameter(torch.zeros(max_seq_len, max_seq_len))
         self.local_window_size = local_window_size
+        self.causal = causal
 
     def forward(self, x):
         B, T, D = x.shape
@@ -132,11 +135,17 @@ class AFTLocal(nn.Module):
         # 窗口外位置不使用额外局部偏置，但仍通过 k/v 保持全局连接。
         bias = bias.masked_fill(~local_mask, 0.0)
 
+        if self.causal:
+            causal_mask = source_positions <= target_positions
+            bias = bias.masked_fill(~causal_mask, -1e9)
+
         k = k.unsqueeze(1)  # [B, 1, T, D]
         v = v.unsqueeze(1)  # [B, 1, T, D]
         bias = bias.unsqueeze(0).unsqueeze(-1)  # [1, T, T, 1]
 
-        scores = torch.exp(k + bias)  # [B, T, T, D]，第一个T来源于目标位置t，第二个T来源于来源位置s
+        scores = k + bias # [B, T, T, D]，第一个T来源于目标位置t，第二个T来源于来源位置s
+        scores = scores - scores.amax(dim = 2, keepdim=True)
+        scores = torch.exp(scores)
 
         numerator = (scores * v).sum(dim=2)
         denominator = scores.sum(dim=2)
@@ -190,7 +199,9 @@ class AFTConv(nn.Module):
         v = v.unsqueeze(1)  # [B, 1, T, D]
         bias = bias.unsqueeze(0).unsqueeze(-1)  # [1, T, T, 1]
 
-        scores = torch.exp(k + bias)  # [B, T, T, D]，第一个T来源于目标位置t，第二个T来源于来源位置s
+        scores = k + bias  # [B, T, T, D]，第一个T来源于目标位置t，第二个T来源于来源位置s
+        scores = scores - scores.amax(dim=2, keepdim=True)
+        scores = torch.exp(scores)
 
         numerator = (scores * v).sum(dim=2)
         denominator = scores.sum(dim=2)

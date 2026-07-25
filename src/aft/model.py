@@ -19,6 +19,7 @@ class AFTLanguageModel(nn.Module):
             aft_type="simple",
             local_window_size=None,
             kernel_size=None,
+            causal=False,
     ):
         super().__init__()
 
@@ -36,7 +37,8 @@ class AFTLanguageModel(nn.Module):
                      aft_type=aft_type,
                      max_seq_len=max_seq_len,
                      local_window_size=local_window_size,
-                     kernel_size=kernel_size
+                     kernel_size=kernel_size,
+                     causal=causal,
                      )
             for _ in range(n_layers)
         ])

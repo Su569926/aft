@@ -153,3 +153,57 @@ def test_aft_language_model_conv_shape():
     input_ids = torch.randint(0, 20, (2, 4))
     logits = model(input_ids)
     assert logits.shape == (2, 4, 20)
+
+def test_aft_local_causal_does_not_use_future_tokens():
+    aft = AFTLocal(
+        d_model=8,
+        max_seq_len=16,
+        local_window_size=2,
+        dropout=0.0,
+        causal=True,
+    )
+
+    aft.eval()
+
+    x1 = torch.randn(1, 4, 8)
+    x2 = x1.clone()
+
+    x2[:, 3, :] = torch.randn(1, 8)
+
+    y1 = aft(x1)
+    y2 = aft(x2)
+    assert torch.allclose(y1[:, :3, :], y2[:, :3, :], atol=1e-5)
+
+
+def test_aft_block_causal_local_shape():
+    block = AFTBlock(
+        d_model=8,
+        hidden_dim=32,
+        dropout=0.0,
+        aft_type="local",
+        max_seq_len=16,
+        local_window_size=2,
+        causal=True,
+    )
+
+    x = torch.randn(2, 4, 8)
+    y = block(x)
+    assert y.shape == x.shape
+
+def test_aft_language_model_causal_local_shape():
+    model = AFTLanguageModel(
+        vocab_size=20,
+        d_model=8,
+        hidden_dim=32,
+        n_layers=2,
+        max_seq_len=16,
+        dropout=0.0,
+        aft_type="local",
+        local_window_size=2,
+        causal=True,
+    )
+
+    input_ids = torch.randint(0, 20, (2, 4))
+    logits = model(input_ids)
+
+    assert logits.shape == (2, 4, 20)
