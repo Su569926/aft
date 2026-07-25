@@ -25,6 +25,7 @@ def parse_args():
     parser.add_argument("--output-path", type=str, default="outputs/aft_enwik8.pt")
     parser.add_argument("--log-path", type=str, default="outputs/train_enwik8_log.csv")
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--use-checkpoint", action="store_true")
     return parser.parse_args()
 
 args = parse_args()
@@ -52,6 +53,7 @@ local_window_size = args.local_window_size
 kernel_size = args.kernel_size
 causal = args.causal
 amp = args.amp
+use_checkpoint = args.use_checkpoint
 vocab_size = 256
 
 train_data = torch.load(train_path, map_location="cpu")
@@ -84,6 +86,7 @@ print("  causal:", causal)
 print("  output_path:", output_path)
 print("  log_path:", log_path)
 print("  amp:", amp)
+print("  use_checkpoint:", use_checkpoint)
 
 model = AFTLanguageModel(
     vocab_size=vocab_size,
@@ -96,6 +99,7 @@ model = AFTLanguageModel(
     local_window_size=local_window_size,
     kernel_size=kernel_size,
     causal=causal,
+    use_checkpoint=use_checkpoint,
 )
 model = model.to(device)
 

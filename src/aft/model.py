@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from aft.blocks import AFTBlock
 
@@ -20,6 +21,7 @@ class AFTLanguageModel(nn.Module):
             local_window_size=None,
             kernel_size=None,
             causal=False,
+            use_checkpoint=False,
     ):
         super().__init__()
 
@@ -47,6 +49,7 @@ class AFTLanguageModel(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size)#把隐藏向量变成词表预测分数
         self.dropout = nn.Dropout(dropout)
+        self.use_checkpoint = use_checkpoint
 
     def forward(self, input_ids):
         # input_ids: [B, T]，其中每个值都是整数 token id。
@@ -64,7 +67,10 @@ class AFTLanguageModel(nn.Module):
 
         # 依次通过多层 AFTBlock。
         for block in self.blocks:
-            x = block(x)
+            if self.use_checkpoint and self.training:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         # logits[b, t] 是位置 t 上对所有下一个 token 类别的预测分数。
         x = self.norm(x)

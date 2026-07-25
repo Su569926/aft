@@ -33,6 +33,7 @@ model = AFTLanguageModel(
     local_window_size=config["local_window_size"],
     kernel_size=config.get("kernel_size"),
     causal=config.get("causal", False),
+    use_checkpoint=False,
 )
 
 model.load_state_dict(checkpoint["model_state_dict"])
