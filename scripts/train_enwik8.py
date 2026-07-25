@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--output-path", type=str, default="outputs/aft_enwik8.pt")
     parser.add_argument("--log-path", type=str, default="outputs/train_enwik8_log.csv")
+    parser.add_argument("--amp", action="store_true")
     return parser.parse_args()
 
 args = parse_args()
@@ -50,6 +51,7 @@ aft_type = args.aft_type
 local_window_size = args.local_window_size
 kernel_size = args.kernel_size
 causal = args.causal
+amp = args.amp
 vocab_size = 256
 
 train_data = torch.load(train_path, map_location="cpu")
@@ -81,6 +83,7 @@ print("  kernel_size:", kernel_size)
 print("  causal:", causal)
 print("  output_path:", output_path)
 print("  log_path:", log_path)
+print("  amp:", amp)
 
 model = AFTLanguageModel(
     vocab_size=vocab_size,
@@ -98,6 +101,7 @@ model = model.to(device)
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+scaler = torch.cuda.amp.GradScaler(enabled=amp)
 start_step = 0
 
 def move_optimizer_state_to_device(optimizer, device):
@@ -126,8 +130,9 @@ def estimate_loss(data, num_batches=20):
 
     for _ in range(num_batches):
         x, y = make_batch(data, batch_size, seq_len, device)
-        logits = model(x)
-        loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
+        with torch.cuda.amp.autocast(enabled=amp):
+            logits = model(x)
+            loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
         losses.append(loss.item())
 
     model.train()
@@ -166,12 +171,20 @@ def write_log(step, train_loss, val_loss):
 for step in range(start_step, num_steps):
     x, y = make_batch(train_data, batch_size, seq_len, device)
 
-    logits = model(x)
-    loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
+
+    with torch.cuda.amp.autocast(enabled=amp):
+        logits = model(x)
+        loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
 
     optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+
+    if amp:
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        optimizer.step()
 
     if step % eval_interval == 0:
         val_loss = estimate_loss(val_data)
