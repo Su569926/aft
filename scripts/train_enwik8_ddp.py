@@ -10,6 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from aft.model import AFTLanguageModel
 
 def parse_args():
+    # DDP 版本保留单卡脚本的所有训练参数，方便两套脚本使用同一套命令习惯。
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -33,6 +34,7 @@ def parse_args():
     return parser.parse_args()
 
 def setup_ddp():
+    # torchrun 会为每个 GPU 启动一个 Python 进程；这里初始化这些进程之间的通信。
     dist.init_process_group(backend="nccl")
 
     local_rank = int(os.environ["LOCAL_RANK"]) #当前进程使用的第几张gpu
@@ -45,11 +47,13 @@ def setup_ddp():
     return device, rank, local_rank, world_size
 
 def cleanup_ddp():
+    # 训练结束后关闭分布式进程组，释放通信资源。
     dist.destroy_process_group()
 
 args = parse_args()
 
 device, rank, local_rank, world_size = setup_ddp()
+# 只让 rank 0 负责打印、写日志、保存 checkpoint，避免多个进程同时写同一个文件。
 is_main_process = rank == 0
 
 data_dir = Path("data/enwik8")
@@ -81,6 +85,7 @@ train_data = torch.load(train_path, map_location="cpu")
 val_data = torch.load(val_path, map_location="cpu")
 
 def make_batch(data, batch_size, seq_len, device):
+    # 每个 rank 都会独立随机抽 batch；DDP 会在反向传播时自动同步各 rank 的梯度。
     starts = torch.randint(0, len(data) - seq_len - 1, (batch_size,))
     x = torch.stack([data[start:start + seq_len] for start in starts])
     y = torch.stack([data[start + 1:start + seq_len + 1] for start in starts])
@@ -129,16 +134,19 @@ model = model.to(device)
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+# AMP 开启时用 GradScaler 缩放 loss，降低 float16 梯度下溢风险。
 scaler = torch.amp.GradScaler("cuda", enabled=amp)
 start_step = 0
 
 def move_optimizer_state_to_device(optimizer, device):
+    # checkpoint 中 optimizer 状态可能先被加载到 CPU；恢复训练前要搬到当前 rank 的 GPU。
     for state in optimizer.state.values():
         for key, value in state.items():
             if torch.is_tensor(value):
                 state[key] = value.to(device)
 
 if output_path.exists():# resume逻辑
+    # 注意：这里在 DDP 包装前加载模型参数，因此 checkpoint 里保存的是原始模型 state_dict。
     checkpoint = torch.load(output_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -151,11 +159,13 @@ if output_path.exists():# resume逻辑
 model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
 if is_main_process and start_step == 0:
+    # 从头训练时创建新日志；resume 时不覆盖旧日志，而是继续追加。
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text("step,train_loss,val_loss\n", encoding="utf-8")
 
 @torch.no_grad()
 def estimate_loss(data, num_batches=20):
+    # 所有 rank 都参与验证，并用 all_reduce 求平均；否则 rank 0 验证时其他 rank 继续训练会卡住。
     model.eval()
     total_loss = 0.0
 
@@ -168,6 +178,7 @@ def estimate_loss(data, num_batches=20):
 
     local_avg_loss = total_loss / num_batches
 
+    # 把每个 rank 的验证 loss 求和，再除以 world_size 得到全局平均验证 loss。
     loss_tensor = torch.tensor(local_avg_loss, device=device)
     dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
     global_avg_loss = loss_tensor.item() / world_size
@@ -176,12 +187,14 @@ def estimate_loss(data, num_batches=20):
     return global_avg_loss
 
 def save_checkpoint(step):
+    # 只有主进程保存，避免多个 rank 同时写同一个 checkpoint 文件。
     if not is_main_process:
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "step": step,
+            # DDP 包装后，真正的原始模型在 model.module 里。
             "model_state_dict": model.module.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "config": {
@@ -207,6 +220,7 @@ def save_checkpoint(step):
     )
 
 def write_log(step, train_loss, val_loss):
+    # 日志同样只让主进程写，避免多进程重复写入。
     if not is_main_process:
         return
     with log_path.open("a", encoding="utf-8") as f:
@@ -216,6 +230,7 @@ for step in range(start_step, num_steps):
     optimizer.zero_grad()
     total_loss = 0.0
 
+    # 梯度累积：多个 micro batch 只 backward，不 step；循环结束后统一更新一次参数。
     for micro_step in range(grad_accum_steps):
         x, y = make_batch(train_data, batch_size, seq_len, device)
 
@@ -223,6 +238,7 @@ for step in range(start_step, num_steps):
         with torch.amp.autocast("cuda", enabled=amp):
             logits = model(x)
             loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
+            # 除以累积步数，保证累积后的梯度相当于大 batch 的平均梯度。
             loss = loss / grad_accum_steps
 
         if amp:
@@ -232,6 +248,7 @@ for step in range(start_step, num_steps):
 
         total_loss += loss.item()
 
+    # 所有 micro batch 的梯度都累积完以后，才真正更新一次参数。
     if amp:
         scaler.step(optimizer)
         scaler.update()
@@ -241,6 +258,7 @@ for step in range(start_step, num_steps):
     train_loss = total_loss
 
     if step % eval_interval == 0:
+        # estimate_loss 内部有 all_reduce，所以所有 rank 必须一起进入。
         val_loss = estimate_loss(val_data)
 
         if is_main_process:
