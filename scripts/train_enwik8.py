@@ -8,6 +8,7 @@ import math
 from aft.model import AFTLanguageModel
 
 def parse_args():
+    # 用命令行参数控制实验配置，避免每次上云调参都手动改代码。
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -31,6 +32,7 @@ def parse_args():
 
 args = parse_args()
 
+# 自动选择 GPU；如果本地没有 CUDA，就退回 CPU 做语法/小规模调试。
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 data_dir = Path("data/enwik8")
@@ -61,9 +63,14 @@ train_data = torch.load(train_path, map_location="cpu")
 val_data = torch.load(val_path, map_location="cpu")
 
 def make_batch(data, batch_size, seq_len, device):
+    # 从长序列中随机抽取 batch_size 个起点。
     starts = torch.randint(0, len(data) - seq_len - 1, (batch_size,))
+
+    # x 是从 start 开始的 seq_len 个 token，y 是整体向后错一位的目标。
     x = torch.stack([data[start:start + seq_len] for start in starts])
     y = torch.stack([data[start + 1:start + seq_len + 1] for start in starts])
+
+    # 整份数据保存在 CPU，只把当前 batch 移到训练设备，节省 GPU 显存。
     return x.to(device), y.to(device)
 
 print("device:", device)
@@ -106,16 +113,19 @@ model = model.to(device)
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+# AMP 开启时用 GradScaler 缩放 loss，降低 float16 梯度下溢风险。
 scaler = torch.amp.GradScaler(enabled=amp)
 start_step = 0
 
 def move_optimizer_state_to_device(optimizer, device):
+    # resume 时 optimizer 状态可能先加载到 CPU，这里把其中的 tensor 搬到当前设备。
     for state in optimizer.state.values():
         for key, value in state.items():
             if torch.is_tensor(value):
                 state[key] = value.to(device)
 
 if output_path.exists():
+    # 如果 checkpoint 已存在，就恢复模型、优化器和 step，从中断处继续训练。
     checkpoint = torch.load(output_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -125,16 +135,19 @@ if output_path.exists():
     print("start step:", start_step)
 
 if start_step == 0:
+    # 从头训练时创建新日志；resume 时保留旧日志并继续追加。
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text("step,train_loss,val_loss,val_bpc\n", encoding="utf-8")
 
 @torch.no_grad()
 def estimate_loss(data, num_batches=20):
+    # 验证阶段不需要梯度，关闭 dropout 等训练行为后估计平均 loss。
     model.eval()
     losses = []
 
     for _ in range(num_batches):
         x, y = make_batch(data, batch_size, seq_len, device)
+        # 评估也可以使用 autocast，节省显存并加速前向计算。
         with torch.amp.autocast(enabled=amp):
             logits = model(x)
             loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
@@ -144,6 +157,7 @@ def estimate_loss(data, num_batches=20):
     return sum(losses) / len(losses)
 
 def save_checkpoint(step):
+    # 保存模型参数、优化器状态和复现实验所需的关键配置。
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -170,19 +184,22 @@ def save_checkpoint(step):
     )
 
 def write_log(step, train_loss, val_loss, val_bpc):
+    # CSV 日志用于后续画曲线和对照论文指标。
     with log_path.open("a", encoding="utf-8") as f:
         f.write(f"{step},{train_loss},{val_loss},{val_bpc}\n")
 
 for step in range(start_step, num_steps):
     x, y = make_batch(train_data, batch_size, seq_len, device)
 
-
+    # logits: [B, T, vocab_size]，y: [B, T]。
     with torch.amp.autocast(enabled=amp):
         logits = model(x)
+        # CrossEntropyLoss 需要 [N, C] 和 [N]，所以把 B 和 T 展平。
         loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
 
     optimizer.zero_grad()
 
+    # AMP 和普通训练的反向传播/参数更新写法不同。
     if amp:
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -193,6 +210,7 @@ for step in range(start_step, num_steps):
 
     if step % eval_interval == 0:
         val_loss = estimate_loss(val_data)
+        # PyTorch 交叉熵单位是 nats；论文 Enwik8 指标 BPC 用 bits，所以除以 ln(2)。
         val_bpc = val_loss / math.log(2)
         print(
             "step:",
@@ -207,6 +225,7 @@ for step in range(start_step, num_steps):
         write_log(step, loss.item(), val_loss, val_bpc)
 
     if step > 0 and step % save_interval == 0:
+        # 定期保存，避免云训练中断后从头再来。
         save_checkpoint(step)
         print("saved checkpoint at step", step)
 
