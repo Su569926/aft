@@ -3,6 +3,7 @@ from pathlib import Path
 import argparse
 import torch
 import torch.nn as nn
+import math
 
 from aft.model import AFTLanguageModel
 
@@ -125,7 +126,7 @@ if output_path.exists():
 
 if start_step == 0:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text("step,train_loss,val_loss\n", encoding="utf-8")
+    log_path.write_text("step,train_loss,val_loss,val_bpc\n", encoding="utf-8")
 
 @torch.no_grad()
 def estimate_loss(data, num_batches=20):
@@ -168,9 +169,9 @@ def save_checkpoint(step):
         output_path,
     )
 
-def write_log(step, train_loss, val_loss):
+def write_log(step, train_loss, val_loss, val_bpc):
     with log_path.open("a", encoding="utf-8") as f:
-        f.write(f"{step},{train_loss},{val_loss}\n")
+        f.write(f"{step},{train_loss},{val_loss},{val_bpc}\n")
 
 for step in range(start_step, num_steps):
     x, y = make_batch(train_data, batch_size, seq_len, device)
@@ -192,6 +193,7 @@ for step in range(start_step, num_steps):
 
     if step % eval_interval == 0:
         val_loss = estimate_loss(val_data)
+        val_bpc = val_loss / math.log(2)
         print(
             "step:",
             step,
@@ -199,8 +201,10 @@ for step in range(start_step, num_steps):
             loss.item(),
             "val loss:",
             val_loss,
+            "val bpc:",
+            val_bpc,
         )
-        write_log(step, loss.item(), val_loss)
+        write_log(step, loss.item(), val_loss, val_bpc)
 
     if step > 0 and step % save_interval == 0:
         save_checkpoint(step)

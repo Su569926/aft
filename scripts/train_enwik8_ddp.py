@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import math
 
 import argparse
 import torch
@@ -161,7 +162,7 @@ model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 if is_main_process and start_step == 0:
     # 从头训练时创建新日志；resume 时不覆盖旧日志，而是继续追加。
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text("step,train_loss,val_loss\n", encoding="utf-8")
+    log_path.write_text("step,train_loss,val_loss,val_bpc\n", encoding="utf-8")
 
 @torch.no_grad()
 def estimate_loss(data, num_batches=20):
@@ -219,12 +220,12 @@ def save_checkpoint(step):
         output_path,
     )
 
-def write_log(step, train_loss, val_loss):
+def write_log(step, train_loss, val_loss, val_bpc):
     # 日志同样只让主进程写，避免多进程重复写入。
     if not is_main_process:
         return
     with log_path.open("a", encoding="utf-8") as f:
-        f.write(f"{step},{train_loss},{val_loss}\n")
+        f.write(f"{step},{train_loss},{val_loss},{val_bpc}\n")
 
 for step in range(start_step, num_steps):
     optimizer.zero_grad()
@@ -260,6 +261,7 @@ for step in range(start_step, num_steps):
     if step % eval_interval == 0:
         # estimate_loss 内部有 all_reduce，所以所有 rank 必须一起进入。
         val_loss = estimate_loss(val_data)
+        val_bpc = val_loss / math.log(2)
 
         if is_main_process:
             print(
@@ -269,8 +271,10 @@ for step in range(start_step, num_steps):
                 train_loss,
                 "val loss:",
                 val_loss,
+                "val bpc:",
+                val_bpc,
             )
-            write_log(step, train_loss, val_loss)
+            write_log(step, train_loss, val_loss, val_bpc)
 
     if is_main_process and step > 0 and step % save_interval == 0:
         save_checkpoint(step)
