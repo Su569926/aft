@@ -5,6 +5,7 @@ import torch
 from aft.layers import FeedForward, AFTSimple, AFTFull, AFTLocal, AFTConv
 from aft.blocks import AFTBlock
 from aft.model import AFTLanguageModel
+from aft.vision import PatchEmbedding, AFTConv2D, VisionBlock, AFTImageClassifier
 
 # 这些测试故意写得很小，用来快速发现 shape 或 API 调用错误。
 
@@ -207,3 +208,90 @@ def test_aft_language_model_causal_local_shape():
     logits = model(input_ids)
 
     assert logits.shape == (2, 4, 20)
+
+def test_patch_embedding_shape():
+    patch = PatchEmbedding(
+        image_size=224,
+        patch_size=16,
+        in_channels=3,
+        d_model=64,
+    )
+
+    x = torch.randn(2, 3, 224, 224)
+    y = patch(x)
+
+    assert y.shape == (2, 196, 64)
+
+
+def test_aft_conv2d_shape_and_backward():
+    aft = AFTConv2D(
+        d_model=64,
+        image_size=224,
+        patch_size=16,
+        kernel_size=3,
+        dropout=0.0,
+    )
+
+    x = torch.randn(2, 196, 64)
+    y = aft(x)
+
+    assert y.shape == x.shape
+
+    loss = y.mean()
+    loss.backward()
+
+    assert aft.to_q.weight.grad is not None
+    assert aft.to_k.weight.grad is not None
+    assert aft.to_v.weight.grad is not None
+    assert aft.position_bias.grad is not None
+    assert aft.out_proj.weight.grad is not None
+
+def test_vision_block_shape_and_backward():
+    block = VisionBlock(
+        d_model=64,
+        hidden_dim=256,
+        image_size=224,
+        patch_size=16,
+        kernel_size=3,
+        dropout=0.0,
+    )
+
+    x = torch.randn(2, 196, 64)
+    y = block(x)
+
+    assert y.shape == x.shape
+
+    loss = y.mean()
+    loss.backward()
+
+    assert block.aft.to_q.weight.grad is not None
+    assert block.aft.position_bias.grad is not None
+    assert block.ffn.fc1.weight.grad is not None
+    assert block.ffn.fc2.weight.grad is not None
+
+
+def test_aft_image_classifier_shape_and_backward():
+    model = AFTImageClassifier(
+        image_size=224,
+        patch_size=16,
+        in_channels=3,
+        num_classes=1000,
+        d_model=64,
+        hidden_dim=256,
+        n_layers=2,
+        kernel_size=3,
+        dropout=0.0,
+    )
+
+    x = torch.randn(2, 3, 224, 224)
+    logits = model(x)
+
+    assert logits.shape == (2, 1000)
+
+    loss = logits.mean()
+    loss.backward()
+
+    assert model.patch_embed.proj.weight.grad is not None
+    assert model.position_embedding.grad is not None
+    assert model.blocks[0].aft.position_bias.grad is not None
+    assert model.head.weight.grad is not None
