@@ -34,6 +34,8 @@ model = AFTLanguageModel(
     local_window_size=config["local_window_size"],
     kernel_size=config.get("kernel_size"),
     causal=config.get("causal", False),
+    use_low_rank_bias=config.get("use_low_rank_bias", False),
+    bias_rank=config.get("bias_rank", 64),
     use_checkpoint=False,
 )
 

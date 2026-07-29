@@ -112,7 +112,16 @@ class AFTFull(nn.Module):
 class AFTLocal(nn.Module):
     """AFT-local：在 AFT-full 的基础上屏蔽局部窗口外的位置。"""
 
-    def __init__(self, d_model, max_seq_len, local_window_size, dropout, causal=False):
+    def __init__(
+            self,
+            d_model,
+            max_seq_len,
+            local_window_size,
+            dropout,
+            causal=False,
+            use_low_rank_bias=False,
+            bias_rank=64,
+    ):
         super().__init__()
 
         self.to_q = nn.Linear(d_model, d_model)
@@ -122,7 +131,20 @@ class AFTLocal(nn.Module):
         self.dropout = nn.Dropout(dropout)
         # AFT-local 仍然保留 [max_seq_len, max_seq_len] 的位置偏置表；
         # forward 时只让局部窗口内的位置使用额外偏置。
-        self.position_bias = nn.Parameter(torch.zeros(max_seq_len, max_seq_len))
+        self.use_low_rank_bias = use_low_rank_bias
+        self.bias_rank = bias_rank
+
+        # 公式 7：w_{t,s} = u_t^T v_s。
+        # position_u: [max_seq_len, R]，给目标位置 t 用。
+        # position_v: [max_seq_len, R]，给来源位置 s 用。
+        # 不能全 0 初始化，否则 u 和 v 的梯度会互相卡住，所以用小随机数。
+        if use_low_rank_bias:
+            self.position_u = nn.Parameter(torch.empty(max_seq_len, bias_rank))
+            self.position_v = nn.Parameter(torch.empty(max_seq_len, bias_rank))
+            nn.init.normal_(self.position_u, mean=0.0, std=0.02)
+            nn.init.normal_(self.position_v, mean=0.0, std=0.02)
+        else:
+            self.position_bias = nn.Parameter(torch.zeros(max_seq_len, max_seq_len))
         self.local_window_size = local_window_size
         self.causal = causal
 
@@ -132,8 +154,13 @@ class AFTLocal(nn.Module):
         k = self.to_k(x)
         v = self.to_v(x)
 
-        # 先取完整的 [T, T] 偏置矩阵，再只保留附近窗口内的来源位置。
-        bias = self.position_bias[:T, :T]
+        if self.use_low_rank_bias:
+            # [T, R] @ [R, T] -> [T, T]
+            # bias[t, s] 就是 u_t 和 v_s 的点积，对应论文里的 u_t^T v_s。
+            bias = self.position_u[:T] @ self.position_v[:T].transpose(0, 1)
+        else:
+            # 先取完整的 [T, T] 偏置矩阵，再只保留附近窗口内的来源位置。
+            bias = self.position_bias[:T, :T]
         positions = torch.arange(T, device=x.device)
         target_positions = positions.unsqueeze(1)
         source_positions = positions.unsqueeze(0)

@@ -16,6 +16,8 @@ class AFTBlock(nn.Module):
             local_window_size=None,
             kernel_size=None,
             causal=False,
+            use_low_rank_bias=False,
+            bias_rank=64,
     ):
         super().__init__()
 
@@ -25,6 +27,8 @@ class AFTBlock(nn.Module):
         # kernel_size 现在只保留给旧脚本/checkpoint 配置兼容。
         # 1D AFTConv 已删除，语言模型正式训练只使用 simple/full/local。
         _ = kernel_size
+        # use_low_rank_bias / bias_rank 用于论文公式 7：
+        # 用低秩分解 w_{t,s}=u_t^T v_s 生成 AFT-local 的位置偏置。
 
         # 根据 aft_type 选择具体的 token 混合子层。
         if aft_type == "simple":
@@ -38,7 +42,15 @@ class AFTBlock(nn.Module):
                 raise ValueError("max_seq_len must be provided when aft_type='local'")
             if local_window_size is None:
                 raise ValueError("local_window_size must be provided when aft_type='local'")
-            self.aft = AFTLocal(d_model, max_seq_len, local_window_size, dropout, causal)
+            self.aft = AFTLocal(
+                d_model,
+                max_seq_len,
+                local_window_size,
+                dropout,
+                causal,
+                use_low_rank_bias=use_low_rank_bias,
+                bias_rank=bias_rank
+            )
         else:
             raise ValueError(f"Unsupported aft_type: {aft_type}. Expected 'simple', 'full', or 'local'.")
 

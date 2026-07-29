@@ -294,3 +294,78 @@ def test_aft_image_classifier_without_position_embedding_shape():
 
     assert logits.shape == (2, 1000)
     assert model.position_embedding is None
+
+
+def test_aft_local_low_rank_shape_and_backward():
+    aft = AFTLocal(
+        d_model=8,
+        max_seq_len=16,
+        local_window_size=2,
+        dropout=0.0,
+        causal=True,
+        use_low_rank_bias=True,
+        bias_rank=4,
+    )
+
+    x = torch.randn(2, 4, 8)
+    y = aft(x)
+
+    assert y.shape == x.shape
+
+    loss = y.mean()
+    loss.backward()
+
+    assert aft.position_u.grad is not None
+    assert aft.position_v.grad is not None
+
+
+def test_aft_block_low_rank_local_shape_and_backward():
+    block = AFTBlock(
+        d_model=8,
+        hidden_dim=32,
+        dropout=0.0,
+        aft_type="local",
+        max_seq_len=16,
+        local_window_size=2,
+        causal=True,
+        use_low_rank_bias=True,
+        bias_rank=4,
+    )
+
+    x = torch.randn(2, 4, 8)
+    y = block(x)
+
+    assert y.shape == x.shape
+
+    loss = y.mean()
+    loss.backward()
+
+    assert block.aft.position_u.grad is not None
+    assert block.aft.position_v.grad is not None
+
+
+def test_aft_language_model_low_rank_local_shape_and_backward():
+    model = AFTLanguageModel(
+        vocab_size=20,
+        d_model=8,
+        hidden_dim=32,
+        n_layers=2,
+        max_seq_len=16,
+        dropout=0.0,
+        aft_type="local",
+        local_window_size=2,
+        causal=True,
+        use_low_rank_bias=True,
+        bias_rank=4,
+    )
+
+    input_ids = torch.randint(0, 20, (2, 4))
+    logits = model(input_ids)
+
+    assert logits.shape == (2, 4, 20)
+
+    loss = logits.mean()
+    loss.backward()
+
+    assert model.blocks[0].aft.position_u.grad is not None
+    assert model.blocks[0].aft.position_v.grad is not None

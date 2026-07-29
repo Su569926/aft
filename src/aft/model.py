@@ -21,6 +21,8 @@ class AFTLanguageModel(nn.Module):
             local_window_size=None,
             kernel_size=None,
             causal=False,
+            use_low_rank_bias=False,
+            bias_rank=64,
             use_checkpoint=False,
     ):
         super().__init__()
@@ -41,6 +43,8 @@ class AFTLanguageModel(nn.Module):
                      local_window_size=local_window_size,
                      kernel_size=kernel_size,
                      causal=causal,
+                     use_low_rank_bias=use_low_rank_bias,
+                     bias_rank=bias_rank
                      )
             for _ in range(n_layers)
         ])
@@ -52,6 +56,8 @@ class AFTLanguageModel(nn.Module):
         # Activation checkpointing，中文常叫“激活检查点”：
         # 训练时少保存中间激活，反向传播时重新计算一部分前向，以时间换显存。
         self.use_checkpoint = use_checkpoint
+        self.use_low_rank_bias = use_low_rank_bias
+        self.bias_rank = bias_rank
 
     def forward(self, input_ids):
         # input_ids: [B, T]，其中每个值都是整数 token id。

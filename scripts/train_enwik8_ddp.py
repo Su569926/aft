@@ -27,6 +27,8 @@ def parse_args():
     parser.add_argument("--aft-type", type=str, default="local")
     parser.add_argument("--local-window-size", type=int, default=32)
     parser.add_argument("--kernel-size", type=int, default=None)
+    parser.add_argument("--use-low-rank-bias", action="store_true")
+    parser.add_argument("--bias-rank", type=int, default=64)
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--output-path", type=str, default="outputs/aft_enwik8.pt")
     parser.add_argument("--log-path", type=str, default="outputs/train_enwik8_log.csv")
@@ -79,6 +81,8 @@ aft_type = args.aft_type
 local_window_size = args.local_window_size
 kernel_size = args.kernel_size
 causal = args.causal
+use_low_rank_bias = args.use_low_rank_bias
+bias_rank = args.bias_rank
 amp = args.amp
 use_checkpoint = args.use_checkpoint
 grad_accum_steps = args.grad_accum_steps
@@ -114,6 +118,8 @@ if is_main_process:
     print("  local_window_size:", local_window_size)
     print("  kernel_size:", kernel_size)
     print("  causal:", causal)
+    print("  use_low_rank_bias:", use_low_rank_bias)
+    print("  bias_rank:", bias_rank)
     print("  output_path:", output_path)
     print("  log_path:", log_path)
     print("  amp:", amp)
@@ -132,6 +138,8 @@ model = AFTLanguageModel(
     local_window_size=local_window_size,
     kernel_size=kernel_size,
     causal=causal,
+    use_low_rank_bias=use_low_rank_bias,
+    bias_rank=bias_rank,
     use_checkpoint=use_checkpoint,
 )
 model = model.to(device)
@@ -218,6 +226,8 @@ def save_checkpoint(step):
                 "local_window_size": local_window_size,
                 "kernel_size": kernel_size,
                 "causal": causal,
+                "use_low_rank_bias": use_low_rank_bias,
+                "bias_rank": bias_rank,
                 "grad_accum_steps": grad_accum_steps,
                 "world_size": world_size,
                 "effective_batch_size": batch_size * world_size * grad_accum_steps,
