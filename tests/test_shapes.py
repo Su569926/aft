@@ -223,6 +223,8 @@ def test_aft_conv2d_shape_and_backward():
     assert aft.to_v.weight.grad is not None
     assert aft.position_bias.grad is not None
     assert aft.out_proj.weight.grad is not None
+    assert aft.position_gain.grad is not None
+    assert aft.position_offset.grad is not None
 
 def test_vision_block_shape_and_backward():
     block = VisionBlock(

@@ -59,6 +59,9 @@ class AFTConv2D(nn.Module):
             torch.zeros(d_model, 1, kernel_size, kernel_size)
         ) #1是每个输出通道只看1个输入通道，是论文中的depthwise convolution深度可分离
 
+        self.position_gain = nn.Parameter(torch.zeros(d_model, 1, 1, 1))
+        self.position_offset = nn.Parameter(torch.zeros(d_model, 1, 1, 1))
+
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
@@ -89,9 +92,17 @@ class AFTConv2D(nn.Module):
         kv_2d = kv.transpose(1, 2).reshape(B, D, self.grid_size, self.grid_size)
         normalizer_2d = normalizer.transpose(1, 2).reshape(B, D, self.grid_size, self.grid_size)
 
-        # exp(w)-1 是论文 AFT-conv 的局部修正形式。
-        # 当 position_bias 初始化为 0 时，局部项为 0，模型先退化成全局 AFT-simple。
-        conv_weight = torch.exp(self.position_bias) - 1.0
+        # 当 position_bias 初始化为 0 时，局部项为 0，模型先退化成全局 AFT-simple。对每个通道自己的 K x K 卷积核做标准化。
+        raw_bias = self.position_bias #[D, 1, K, K]
+
+        bias_mean = raw_bias.mean(dim=(2, 3), keepdim=True) #[D, 1, 1, 1]
+        bias_std = raw_bias.std(dim=(2, 3), keepdim=True, unbiased=False) #[D, 1, 1, 1]
+
+        normalized_bias = (raw_bias - bias_mean) / (bias_std + 1e-6)
+
+        position_bias = self.position_gain * normalized_bias + self.position_offset
+
+        conv_weight = torch.exp(position_bias) - 1.0
 
         # 局部分子项：在二维 patch 网格上，用 K x K 邻域补充局部位置偏置。
         # groups=D 表示每个通道单独卷积，输入输出仍是 [B, D, grid, grid]。
