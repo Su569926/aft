@@ -24,6 +24,8 @@ def parse_args():
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--save-interval", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--min-learning-rate", type=float, default=1e-5)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--aft-type", type=str, default="local")
     parser.add_argument("--local-window-size", type=int, default=32)
     parser.add_argument("--kernel-size", type=int, default=None)
@@ -77,6 +79,8 @@ num_steps = args.num_steps
 eval_interval = args.eval_interval
 save_interval = args.save_interval
 learning_rate = args.learning_rate
+min_learning_rate = args.min_learning_rate
+warmup_steps = args.warmup_steps
 aft_type = args.aft_type
 local_window_size = args.local_window_size
 kernel_size = args.kernel_size
@@ -114,6 +118,8 @@ if is_main_process:
     print("  eval_interval:", eval_interval)
     print("  save_interval:", save_interval)
     print("  learning_rate:", learning_rate)
+    print("  min_learning_rate:", min_learning_rate)
+    print("  warmup_steps:", warmup_steps)
     print("  aft_type:", aft_type)
     print("  local_window_size:", local_window_size)
     print("  kernel_size:", kernel_size)
@@ -169,12 +175,29 @@ if output_path.exists():# resume逻辑
         print("resumed from checkpoint:", output_path)
         print("start step:", start_step)
 
+def get_learning_rate(step):
+    if step < warmup_steps:
+        return learning_rate * float(step + 1) / float(warmup_steps)
+
+    decay_steps = num_steps - warmup_steps
+    decay_progress = float(step - warmup_steps) / float(max(1, decay_steps))
+
+    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+
+    lr = min_learning_rate + (learning_rate - min_learning_rate) * cosine_decay
+
+    return lr
+
+def set_learning_rate(optimizer, lr):
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
 model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
 if is_main_process and start_step == 0:
     # 从头训练时创建新日志；resume 时不覆盖旧日志，而是继续追加。
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text("step,train_loss,val_loss,val_bpc\n", encoding="utf-8")
+    log_path.write_text("step,lr,train_loss,val_loss,val_bpc\n", encoding="utf-8")
 
 @torch.no_grad()
 def estimate_loss(data, num_batches=20):
@@ -222,6 +245,8 @@ def save_checkpoint(step):
                 "dropout": dropout,
                 "num_steps": num_steps,
                 "learning_rate": learning_rate,
+                "min_learning_rate": min_learning_rate,
+                "warmup_steps": warmup_steps,
                 "aft_type": aft_type,
                 "local_window_size": local_window_size,
                 "kernel_size": kernel_size,
@@ -236,14 +261,17 @@ def save_checkpoint(step):
         output_path,
     )
 
-def write_log(step, train_loss, val_loss, val_bpc):
+def write_log(step, lr, train_loss, val_loss, val_bpc):
     # 日志同样只让主进程写，避免多进程重复写入。
     if not is_main_process:
         return
     with log_path.open("a", encoding="utf-8") as f:
-        f.write(f"{step},{train_loss},{val_loss},{val_bpc}\n")
+        f.write(f"{step},{lr},{train_loss},{val_loss},{val_bpc}\n")
 
 for step in range(start_step, num_steps):
+    lr = get_learning_rate(step)
+    set_learning_rate(optimizer, lr)
+
     optimizer.zero_grad()
     total_loss = 0.0
 
@@ -286,6 +314,8 @@ for step in range(start_step, num_steps):
             print(
                 "step:",
                 step,
+                "lr:",
+                lr,
                 "train loss:",
                 train_loss,
                 "val loss:",
@@ -293,7 +323,7 @@ for step in range(start_step, num_steps):
                 "val bpc:",
                 val_bpc,
             )
-            write_log(step, train_loss, val_loss, val_bpc)
+            write_log(step, lr, train_loss, val_loss, val_bpc)
 
     if is_main_process and step > 0 and step % save_interval == 0:
         save_checkpoint(step)
