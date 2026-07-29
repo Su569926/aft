@@ -46,6 +46,7 @@ model = model.to(device)
 model.eval()
 
 def sample_next_token(logits, temperature, top_k):
+    # logits: [256]，表示下一个 byte 取 0..255 每个值的未归一化分数。
     # temperature 控制采样随机性；小于 1 更保守，大于 1 更随机。
     logits = logits / temperature
 
@@ -57,6 +58,7 @@ def sample_next_token(logits, temperature, top_k):
         logits = filtered_logits
 
     probs = torch.softmax(logits, dim=-1)
+    # multinomial 是“按概率抽样”，不是取最大概率；这样生成图像会有随机性。
     return torch.multinomial(probs, num_samples=1).item()
 
 # CIFAR10 图像是 3*32*32，因此完整图片需要 3072 个像素通道值。

@@ -11,6 +11,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from aft.model import AFTLanguageModel
 
 def parse_args():
+    # DDP = DistributedDataParallel，中文常叫“分布式数据并行”。
     # DDP 版本保留单卡脚本的所有训练参数，方便两套脚本使用同一套命令习惯。
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq-len", type=int, default=128)
@@ -35,6 +36,7 @@ def parse_args():
     return parser.parse_args()
 
 def setup_ddp():
+    # NCCL 是 NVIDIA GPU 多卡通信常用后端，适合 CUDA 上的 DDP 训练。
     # torchrun 会为每个 GPU 启动一个 Python 进程；这里初始化这些进程之间的通信。
     dist.init_process_group(backend="nccl")
 
@@ -87,6 +89,7 @@ val_data = torch.load(val_path, map_location="cpu")
 
 def make_batch(data, batch_size, seq_len, device):
     # 每个 rank 都会独立随机抽 batch；DDP 会在反向传播时自动同步各 rank 的梯度。
+    # x: [B, T] 是输入 token；y: [B, T] 是向后错一位的下一个 token 目标。
     starts = torch.randint(0, len(data) - seq_len - 1, (batch_size,))
     x = torch.stack([data[start:start + seq_len] for start in starts])
     y = torch.stack([data[start + 1:start + seq_len + 1] for start in starts])
@@ -135,6 +138,7 @@ model = model.to(device)
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+# AMP = Automatic Mixed Precision，中文常叫“自动混合精度”。
 # AMP 开启时用 GradScaler 缩放 loss，降低 float16 梯度下溢风险。
 scaler = torch.amp.GradScaler("cuda", enabled=amp)
 start_step = 0
@@ -174,6 +178,8 @@ def estimate_loss(data, num_batches=20):
         x, y = make_batch(data, batch_size, seq_len, device)
         with torch.amp.autocast("cuda", enabled=amp):
             logits = model(x)
+            # logits: [B, T, vocab_size]，y: [B, T]。
+            # CrossEntropyLoss 需要 [样本数, 类别数] 和 [样本数]，所以把 B*T 展平。
             loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
         total_loss += loss.item()
 
@@ -231,7 +237,8 @@ for step in range(start_step, num_steps):
     optimizer.zero_grad()
     total_loss = 0.0
 
-    # 梯度累积：多个 micro batch 只 backward，不 step；循环结束后统一更新一次参数。
+    # Gradient Accumulation，中文常叫“梯度累积”：
+    # 多个 micro batch 只 backward，不 step；循环结束后统一更新一次参数。
     for micro_step in range(grad_accum_steps):
         x, y = make_batch(train_data, batch_size, seq_len, device)
 
@@ -261,6 +268,8 @@ for step in range(start_step, num_steps):
     if step % eval_interval == 0:
         # estimate_loss 内部有 all_reduce，所以所有 rank 必须一起进入。
         val_loss = estimate_loss(val_data)
+        # BPC = bits per character，中文可理解为“每字符比特数”。
+        # CrossEntropyLoss 的单位是 nats，除以 ln(2) 后转换成 bits。
         val_bpc = val_loss / math.log(2)
 
         if is_main_process:

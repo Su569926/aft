@@ -49,6 +49,8 @@ class AFTLanguageModel(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size)#把隐藏向量变成词表预测分数
         self.dropout = nn.Dropout(dropout)
+        # Activation checkpointing，中文常叫“激活检查点”：
+        # 训练时少保存中间激活，反向传播时重新计算一部分前向，以时间换显存。
         self.use_checkpoint = use_checkpoint
 
     def forward(self, input_ids):
@@ -68,6 +70,7 @@ class AFTLanguageModel(nn.Module):
         # 依次通过多层 AFTBlock。
         for block in self.blocks:
             if self.use_checkpoint and self.training:
+                # checkpoint 只在训练阶段使用；验证/生成阶段不需要节省反向传播激活。
                 x = checkpoint(block, x, use_reentrant=False)
             else:
                 x = block(x)

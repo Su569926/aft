@@ -22,6 +22,7 @@ def make_batch(batch_size, seq_len, vocab_size, device):
     return input_ids, targets
 
 # 推理加载 checkpoint 时，模型超参数必须和这里保持一致。
+# 这里用 AFT-local 做 toy sanity check；1D AFTConv 已删除，图像卷积版本在 vision.py 里。
 model = AFTLanguageModel(
     vocab_size=vocab_size,
     d_model=32,
@@ -29,8 +30,9 @@ model = AFTLanguageModel(
     n_layers=2,
     max_seq_len=seq_len,
     dropout=0.0,
-    aft_type="conv",
-    kernel_size=3,
+    aft_type="local",
+    local_window_size=2,
+    causal=True,
 )
 
 model = model.to(device)
@@ -55,4 +57,4 @@ for step in range(num_steps):
         print("step:", step, "loss:", loss.item())
 
 # 只保存学到的参数；推理脚本会重新创建同结构模型，再加载这个 state_dict。
-torch.save(model.state_dict(), "outputs/aft_conv_toy.pt")
+torch.save(model.state_dict(), "outputs/aft_local_toy.pt")

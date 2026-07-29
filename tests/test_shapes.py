@@ -2,7 +2,7 @@
 
 import torch
 
-from aft.layers import FeedForward, AFTSimple, AFTFull, AFTLocal, AFTConv
+from aft.layers import FeedForward, AFTSimple, AFTFull, AFTLocal
 from aft.blocks import AFTBlock
 from aft.model import AFTLanguageModel
 from aft.vision import PatchEmbedding, AFTConv2D, VisionBlock, AFTImageClassifier
@@ -127,28 +127,6 @@ def test_aft_language_model_local_shape():
         dropout=0.0,
         aft_type="local",
         local_window_size=1
-    )
-
-    input_ids = torch.randint(0, 20, (2, 4))
-    logits = model(input_ids)
-    assert logits.shape == (2, 4, 20)
-
-def test_aft_conv_shape():
-    aft = AFTConv(8, 3, 0.0)
-    x = torch.randn(2, 4, 8)
-    y = aft(x)
-    assert y.shape == x.shape
-
-def test_aft_language_model_conv_shape():
-    model = AFTLanguageModel(
-        vocab_size=20,
-        d_model=8,
-        hidden_dim=32,
-        n_layers=2,
-        max_seq_len=16,
-        dropout=0.0,
-        aft_type="conv",
-        kernel_size=3,
     )
 
     input_ids = torch.randint(0, 20, (2, 4))
@@ -281,6 +259,7 @@ def test_aft_image_classifier_shape_and_backward():
         n_layers=2,
         kernel_size=3,
         dropout=0.0,
+        use_position_embedding=True,
     )
 
     x = torch.randn(2, 3, 224, 224)
@@ -295,3 +274,23 @@ def test_aft_image_classifier_shape_and_backward():
     assert model.position_embedding.grad is not None
     assert model.blocks[0].aft.position_bias.grad is not None
     assert model.head.weight.grad is not None
+
+
+def test_aft_image_classifier_without_position_embedding_shape():
+    model = AFTImageClassifier(
+        image_size=224,
+        patch_size=16,
+        in_channels=3,
+        num_classes=1000,
+        d_model=64,
+        hidden_dim=256,
+        n_layers=2,
+        kernel_size=3,
+        dropout=0.0,
+    )
+
+    x = torch.randn(2, 3, 224, 224)
+    logits = model(x)
+
+    assert logits.shape == (2, 1000)
+    assert model.position_embedding is None

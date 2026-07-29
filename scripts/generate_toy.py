@@ -6,6 +6,7 @@ seq_len = 8
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 模型配置必须和 scripts/train_toy.py 里训练 checkpoint 时完全一致。
+# 这里同样使用 AFT-local；它是序列任务里的局部位置偏置版本。
 model = AFTLanguageModel(
     vocab_size=10,
     d_model=32,
@@ -13,12 +14,13 @@ model = AFTLanguageModel(
     n_layers=2,
     max_seq_len=8,
     dropout=0.0,
-    aft_type="conv",
-    kernel_size=3,
+    aft_type="local",
+    local_window_size=2,
+    causal=True,
 ).to(device)
 
 # map_location 让 checkpoint 可以在 CPU 或 GPU 上加载。
-state_dict = torch.load("outputs/aft_conv_toy.pt", map_location=device)
+state_dict = torch.load("outputs/aft_local_toy.pt", map_location=device)
 model.load_state_dict(state_dict)
 
 # eval() 会关闭 dropout 等只在训练时启用的行为。

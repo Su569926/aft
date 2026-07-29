@@ -22,6 +22,7 @@ checkpoint_path = Path(args.checkpoint)
 checkpoint = torch.load(checkpoint_path, map_location=device)
 config = checkpoint["config"]
 
+# 生成时必须用 checkpoint 里保存的 config 重新创建同结构模型。
 model = AFTLanguageModel(
     vocab_size=config["vocab_size"],
     d_model=config["d_model"],
@@ -49,6 +50,8 @@ if top_k <= 0:
     top_k = None
 
 tokens = list(prompt.encode("utf-8"))
+# enwik8 是 byte-level language modeling；
+# 每个 token 是 0..255 的 byte，所以 prompt 要先 encode 成字节列表。
 
 print("device:", device)
 print("checkpoint:", checkpoint_path)
@@ -67,6 +70,7 @@ for _ in range(num_new_tokens):
     next_logits = logits[0, -1] / temperature #temperature负责调节随机性，小于1，概率更集中更保守；大于1，概率更平更随机
 
     if top_k is not None:
+        # top-k sampling：只允许概率最高的 k 个 token 参与抽样，减少低概率噪声。
         values, indices = torch.topk(next_logits, top_k)
         filtered_logits = torch.full_like(next_logits, -float("inf"))
         filtered_logits[indices] = values
@@ -77,5 +81,6 @@ for _ in range(num_new_tokens):
 
     tokens.append(next_token)
 
+# 生成结果仍然是一串 byte token，最后再解码成人类可读文本。
 text = bytes(tokens).decode("utf-8", errors="replace")
 print(text)

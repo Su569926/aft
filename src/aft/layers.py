@@ -44,6 +44,8 @@ class AFTSimple(nn.Module):
 
     def forward(self, x):
         # x: [B, T, D]
+        # AFT = Attention Free Transformer，中文可以理解为“无注意力 Transformer”。
+        # 这里不显式计算 attention matrix，而是用 k 的 softmax 做全局加权平均。
         q = self.to_q(x)
         k = self.to_k(x)
         v = self.to_v(x)
@@ -73,6 +75,8 @@ class AFTFull(nn.Module):
         self.to_v = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
+        # position_bias[t, s] 表示“目标位置 t 看来源位置 s”时额外加上的位置偏置。
+        # 这是 AFT-full 对论文位置权重 w_{t,s} 的直接参数化。
         self.position_bias = nn.Parameter(torch.zeros(max_seq_len, max_seq_len)) #位置偏置矩阵的形状是[max_seq_len, max_seq_len]
 
     def forward(self, x):
@@ -91,6 +95,7 @@ class AFTFull(nn.Module):
         bias = bias.unsqueeze(0).unsqueeze(-1) # [1, T, T, 1]
 
         scores = k + bias  # [B, T, T, D]，第一个T来源于目标位置t，第二个T来源于来源位置s
+        # 数值稳定处理：先减去来源维度上的最大值，再 exp，避免 exp 输入太大溢出。
         scores = scores - scores.amax(dim=2, keepdim=True)
         scores = torch.exp(scores)
 
@@ -115,6 +120,8 @@ class AFTLocal(nn.Module):
         self.to_v = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
+        # AFT-local 仍然保留 [max_seq_len, max_seq_len] 的位置偏置表；
+        # forward 时只让局部窗口内的位置使用额外偏置。
         self.position_bias = nn.Parameter(torch.zeros(max_seq_len, max_seq_len))
         self.local_window_size = local_window_size
         self.causal = causal
@@ -136,6 +143,7 @@ class AFTLocal(nn.Module):
         bias = bias.masked_fill(~local_mask, 0.0)
 
         if self.causal:
+            # causal mask 用在自回归任务中，保证位置 t 不能看未来位置 s > t。
             causal_mask = source_positions <= target_positions
             bias = bias.masked_fill(~causal_mask, -1e9)
 
@@ -144,63 +152,8 @@ class AFTLocal(nn.Module):
         bias = bias.unsqueeze(0).unsqueeze(-1)  # [1, T, T, 1]
 
         scores = k + bias # [B, T, T, D]，第一个T来源于目标位置t，第二个T来源于来源位置s
+        # 和 AFT-full 一样，exp 前先减最大值做数值稳定。
         scores = scores - scores.amax(dim = 2, keepdim=True)
-        scores = torch.exp(scores)
-
-        numerator = (scores * v).sum(dim=2)
-        denominator = scores.sum(dim=2)
-
-        context = numerator / denominator  # [B, T, D]
-        y = torch.sigmoid(q) * context
-        y = self.out_proj(y)
-        y = self.dropout(y)
-        return y
-
-class AFTConv(nn.Module):
-    """AFT-conv：使用共享相对位置偏置参数的局部 AFT。"""
-
-    def __init__(self, d_model, kernel_size, dropout):
-        super().__init__()
-
-        self.to_q = nn.Linear(d_model, d_model)
-        self.to_k = nn.Linear(d_model, d_model)
-        self.to_v = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.kernel_size = kernel_size
-        # 局部窗口里的每个相对偏移只对应一个共享参数。
-        self.relative_bias = nn.Parameter(torch.zeros(kernel_size))
-        if kernel_size % 2 == 0:
-            raise ValueError("kernel_size must be odd")
-
-    def forward(self, x):
-        B, T, D = x.shape
-        q = self.to_q(x)
-        k = self.to_k(x)
-        v = self.to_v(x)
-
-        # 构造 [T, T] 矩阵，其中 [t, s] 位置表示相对偏移 s - t。
-        positions = torch.arange(T, device=x.device)
-        target_positions = positions.unsqueeze(1)
-        source_positions = positions.unsqueeze(0)
-        relative = source_positions - target_positions #relative[t, s] = s - t，大小还是[T,T]
-
-        # 把相对偏移 [-radius, ..., 0, ..., +radius] 映射到参数表下标。
-        radius = self.kernel_size // 2
-        local_mask = torch.abs(relative) <= radius
-        bias_index = relative + radius
-        bias_index = bias_index.clamp(0, self.kernel_size - 1) #避免索引越界
-
-        # 把很小的相对位置参数表展开成下面计算要用的 [T, T] 偏置矩阵。
-        bias = self.relative_bias[bias_index] #bias是[T, T]，relative_bias是[kernel_size]
-        bias = bias.masked_fill(~local_mask, -1e9)
-
-        k = k.unsqueeze(1)  # [B, 1, T, D]
-        v = v.unsqueeze(1)  # [B, 1, T, D]
-        bias = bias.unsqueeze(0).unsqueeze(-1)  # [1, T, T, 1]
-
-        scores = k + bias  # [B, T, T, D]，第一个T来源于目标位置t，第二个T来源于来源位置s
-        scores = scores - scores.amax(dim=2, keepdim=True)
         scores = torch.exp(scores)
 
         numerator = (scores * v).sum(dim=2)
