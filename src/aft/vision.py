@@ -52,13 +52,15 @@ class AFTConv2D(nn.Module):
         self.to_k = nn.Linear(d_model, d_model)
         self.to_v = nn.Linear(d_model, d_model)
 
-        # 这是论文 AFT-conv 里的局部相对位置参数 w。
+        # 这是论文 AFT-conv 里的局部相对位置参数 w。raw position_bias 用小随机数初始化；
         # 形状 [D, 1, K, K] 配合 groups=D 做 depthwise convolution：
         # 每个特征通道都有自己的一张 K x K 局部位置权重表，不混合不同通道。
         self.position_bias = nn.Parameter(
-            torch.zeros(d_model, 1, kernel_size, kernel_size)
+            torch.empty(d_model, 1, kernel_size, kernel_size)
         ) #1是每个输出通道只看1个输入通道，是论文中的depthwise convolution深度可分离
+        nn.init.normal_(self.position_bias, mean=0.0, std=0.02)
 
+        #position_gain 和 position_offset 初始化为 0，对应论文公式 8。
         self.position_gain = nn.Parameter(torch.zeros(d_model, 1, 1, 1))
         self.position_offset = nn.Parameter(torch.zeros(d_model, 1, 1, 1))
 
@@ -92,7 +94,8 @@ class AFTConv2D(nn.Module):
         kv_2d = kv.transpose(1, 2).reshape(B, D, self.grid_size, self.grid_size)
         normalizer_2d = normalizer.transpose(1, 2).reshape(B, D, self.grid_size, self.grid_size)
 
-        # 当 position_bias 初始化为 0 时，局部项为 0，模型先退化成全局 AFT-simple。对每个通道自己的 K x K 卷积核做标准化。
+        # 公式 8 后的 position_bias 初始为 0，因为 gain 和 offset 都初始化为 0；
+        # 所以 conv_weight = exp(0)-1 = 0，局部项初始不影响全局 AFT-simple。
         raw_bias = self.position_bias #[D, 1, K, K]
 
         bias_mean = raw_bias.mean(dim=(2, 3), keepdim=True) #[D, 1, 1, 1]

@@ -26,6 +26,7 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--min-learning-rate", type=float, default=1e-5)
     parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--aft-type", type=str, default="local")
     parser.add_argument("--local-window-size", type=int, default=256)
     parser.add_argument("--kernel-size", type=int, default=None)
@@ -81,6 +82,7 @@ save_interval = args.save_interval
 learning_rate = args.learning_rate
 min_learning_rate = args.min_learning_rate
 warmup_steps = args.warmup_steps
+weight_decay = args.weight_decay
 aft_type = args.aft_type
 local_window_size = args.local_window_size
 kernel_size = args.kernel_size
@@ -126,6 +128,7 @@ if is_main_process:
     print("  learning_rate:", learning_rate)
     print("  min_learning_rate:", min_learning_rate)
     print("  warmup_steps:", warmup_steps)
+    print("  weight_decay:", weight_decay)
     print("  aft_type:", aft_type)
     print("  local_window_size:", local_window_size)
     print("  kernel_size:", kernel_size)
@@ -157,7 +160,42 @@ model = AFTLanguageModel(
 model = model.to(device)
 
 criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+def build_weight_decay_param_groups(model, weight_decay):
+    # AdamW 参数分组：
+    # 1. 普通权重矩阵使用 weight decay，帮助正则化。
+    # 2. bias、LayerNorm、位置参数不使用 weight decay，避免破坏归一化尺度和位置建模。
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        name_lower = name.lower()
+        if (
+            name.endswith(".bias")
+            or "norm" in name_lower
+            or "position" in name_lower
+            or "pos_emb" in name_lower
+        ):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    return [
+        {
+            "params": decay_params,
+            "weight_decay": weight_decay,
+        },
+        {
+            "params": no_decay_params,
+            "weight_decay": 0.0,
+        },
+    ]
+
+param_groups = build_weight_decay_param_groups(model, weight_decay)
+optimizer = torch.optim.AdamW(param_groups, lr=learning_rate)
 # AMP = Automatic Mixed Precision，中文常叫“自动混合精度”。
 # AMP 开启时用 GradScaler 缩放 loss，降低 float16 梯度下溢风险。
 scaler = torch.amp.GradScaler("cuda", enabled=amp)
@@ -257,6 +295,7 @@ def save_checkpoint(step):
                 "learning_rate": learning_rate,
                 "min_learning_rate": min_learning_rate,
                 "warmup_steps": warmup_steps,
+                "weight_decay": weight_decay,
                 "aft_type": aft_type,
                 "local_window_size": local_window_size,
                 "kernel_size": kernel_size,
