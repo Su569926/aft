@@ -154,6 +154,64 @@ class AFTLocal(nn.Module):
         k = self.to_k(x)
         v = self.to_v(x)
 
+        if self.causal:
+            # causal AFT-local 用在自回归任务里，位置 t 只能看 s <= t 的历史。
+            # 旧写法会构造 scores: [B, T, T, D]。CIFAR10 展平成 byte 序列后 T=3071，
+            # 这个四维张量太大，所以这里改成不显式展开 [T, T, D] 的等价写法。
+            k_float = k.float()
+            v_float = v.float()
+
+            # exp_k / kv: [B, T, D]
+            # 先计算没有位置偏置时的全局历史聚合，也就是每个 t 看所有 s<=t。
+            exp_k = torch.exp(k_float)
+            kv = exp_k * v_float
+            global_numerator = kv.cumsum(dim=1)
+            global_denominator = exp_k.cumsum(dim=1)
+
+            # local_* 只保存局部窗口带来的“修正量”，形状仍然是 [B, T, D]。
+            local_numerator = torch.zeros_like(global_numerator)
+            local_denominator = torch.zeros_like(global_denominator)
+
+            # offset = t - s。causal 情况下只需要 offset>=0 的历史位置。
+            max_offset = min(self.local_window_size, T - 1)
+            for offset in range(max_offset + 1):
+                source_length = T - offset
+
+                if self.use_low_rank_bias:
+                    # 论文公式 7: w_{t,s} = u_t^T v'_s。
+                    # target_bias: [source_length, R]，对应 t=offset..T-1。
+                    # source_bias: [source_length, R]，对应 s=0..T-offset-1。
+                    target_bias = self.position_u[offset:T].float()
+                    source_bias = self.position_v[:source_length].float()
+                    bias = (target_bias * source_bias).sum(dim=-1)
+                else:
+                    # 从完整位置参数表里取 w_{t,t-offset} 这一条对角线。
+                    target_positions = torch.arange(offset, T, device=x.device)
+                    source_positions = target_positions - offset
+                    bias = self.position_bias[target_positions, source_positions].float()
+
+                # 全局项已经有 exp(k_s)。局部窗口内应该从 exp(k_s) 变成 exp(k_s + w_{t,s})，
+                # 所以只需要额外加 exp(k_s) * (exp(w_{t,s}) - 1)。
+                correction = torch.exp(bias).view(1, source_length, 1) - 1.0
+                local_numerator[:, offset:, :] = (
+                    local_numerator[:, offset:, :]
+                    + correction * kv[:, :source_length, :]
+                )
+                local_denominator[:, offset:, :] = (
+                    local_denominator[:, offset:, :]
+                    + correction * exp_k[:, :source_length, :]
+                )
+
+            numerator = global_numerator + local_numerator
+            denominator = global_denominator + local_denominator
+            context = numerator / denominator.clamp_min(1e-6)
+
+            y = torch.sigmoid(q.float()) * context
+            y = y.to(q.dtype)
+            y = self.out_proj(y)
+            y = self.dropout(y)
+            return y
+
         if self.use_low_rank_bias:
             # [T, R] @ [R, T] -> [T, T]
             # bias[t, s] 就是 u_t 和 v_s 的点积，对应论文里的 u_t^T v_s。
