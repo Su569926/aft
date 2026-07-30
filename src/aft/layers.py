@@ -149,7 +149,13 @@ class AFTLocal(nn.Module):
         self.causal = causal
 
     def forward(self, x):
+        # x: [B, T, D]
+        # B = batch size，T = 当前序列长度，D = d_model 特征维度。
         B, T, D = x.shape
+        # q/k/v 都是从 x 线性投影出来的，形状不变：
+        # q: [B, T, D]，每个目标位置 t 的门控向量。
+        # k: [B, T, D]，每个来源位置 s 的权重向量。
+        # v: [B, T, D]，每个来源位置 s 携带的内容向量。
         q = self.to_q(x)
         k = self.to_k(x)
         v = self.to_v(x)
@@ -158,6 +164,8 @@ class AFTLocal(nn.Module):
             # causal AFT-local 用在自回归任务里，位置 t 只能看 s <= t 的历史。
             # 旧写法会构造 scores: [B, T, T, D]。CIFAR10 展平成 byte 序列后 T=3071，
             # 这个四维张量太大，所以这里改成不显式展开 [T, T, D] 的等价写法。
+            # 这里转成 float32 是为了让 exp 在 AMP 混合精度下更稳定。
+            # k_float/v_float: [B, T, D]
             k_float = k.float()
             v_float = v.float()
 
@@ -165,6 +173,9 @@ class AFTLocal(nn.Module):
             # 先计算没有位置偏置时的全局历史聚合，也就是每个 t 看所有 s<=t。
             exp_k = torch.exp(k_float)
             kv = exp_k * v_float
+            # cumsum(dim=1) 沿序列维做前缀和：
+            # global_numerator[:, t, :] = sum_{s=0..t} exp(k_s) * v_s，形状 [B, T, D]。
+            # global_denominator[:, t, :] = sum_{s=0..t} exp(k_s)，形状 [B, T, D]。
             global_numerator = kv.cumsum(dim=1)
             global_denominator = exp_k.cumsum(dim=1)
 
@@ -175,6 +186,8 @@ class AFTLocal(nn.Module):
             # offset = t - s。causal 情况下只需要 offset>=0 的历史位置。
             max_offset = min(self.local_window_size, T - 1)
             for offset in range(max_offset + 1):
+                # 当前这条对角线的长度。
+                # 例：T=6, offset=2 时，合法配对是 (t,s)=(2,0),(3,1),(4,2),(5,3)，长度是 4。
                 source_length = T - offset
 
                 if self.use_low_rank_bias:
@@ -183,29 +196,43 @@ class AFTLocal(nn.Module):
                     # source_bias: [source_length, R]，对应 s=0..T-offset-1。
                     target_bias = self.position_u[offset:T].float()
                     source_bias = self.position_v[:source_length].float()
+                    # 逐元素乘后仍是 [source_length, R]，sum(dim=-1) 后得到当前对角线上的 bias:
+                    # bias[i] = w_{t=i+offset, s=i}，形状 [source_length]。
                     bias = (target_bias * source_bias).sum(dim=-1)
                 else:
                     # 从完整位置参数表里取 w_{t,t-offset} 这一条对角线。
                     target_positions = torch.arange(offset, T, device=x.device)
                     source_positions = target_positions - offset
+                    # target_positions/source_positions: [source_length]
+                    # bias: [source_length]，对应这一条对角线上的 w_{t,s}。
                     bias = self.position_bias[target_positions, source_positions].float()
 
                 # 全局项已经有 exp(k_s)。局部窗口内应该从 exp(k_s) 变成 exp(k_s + w_{t,s})，
                 # 所以只需要额外加 exp(k_s) * (exp(w_{t,s}) - 1)。
+                # correction: [1, source_length, 1]，可以广播到 [B, source_length, D]。
                 correction = torch.exp(bias).view(1, source_length, 1) - 1.0
+                # 左边 local_numerator[:, offset:, :]: [B, source_length, D]，对应目标位置 t=offset..T-1。
+                # 右边 kv[:, :source_length, :]: [B, source_length, D]，对应来源位置 s=0..T-offset-1。
+                # 因为这条对角线满足 t=s+offset，所以两边第二维一一对齐。
                 local_numerator[:, offset:, :] = (
                     local_numerator[:, offset:, :]
                     + correction * kv[:, :source_length, :]
                 )
+                # local_denominator 的形状变化同上，只是这里累加的是权重 exp(k_s)，不乘 v_s。
                 local_denominator[:, offset:, :] = (
                     local_denominator[:, offset:, :]
                     + correction * exp_k[:, :source_length, :]
                 )
 
+            # numerator/denominator: [B, T, D]
+            # 这两行把“全局历史基础项”和“局部位置偏置修正项”加起来。
             numerator = global_numerator + local_numerator
             denominator = global_denominator + local_denominator
+            # context: [B, T, D]，对应每个目标位置 t 聚合后的上下文向量。
             context = numerator / denominator.clamp_min(1e-6)
 
+            # sigmoid(q): [B, T, D]，对 context 做逐元素门控。
+            # out_proj 输出仍是 [B, T, D]，用于重新混合特征维。
             y = torch.sigmoid(q.float()) * context
             y = y.to(q.dtype)
             y = self.out_proj(y)
