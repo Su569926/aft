@@ -185,44 +185,68 @@ class AFTLocal(nn.Module):
 
             # offset = t - s。causal 情况下只需要 offset>=0 的历史位置。
             max_offset = min(self.local_window_size, T - 1)
-            for offset in range(max_offset + 1):
-                # 当前这条对角线的长度。
-                # 例：T=6, offset=2 时，合法配对是 (t,s)=(2,0),(3,1),(4,2),(5,3)，长度是 4。
-                source_length = T - offset
+            # 旧的省显存版本是按 offset 一条对角线一条对角线算，window=256 时每层要循环 257 次。
+            # 这里改成按目标位置分块：一次取 C 个目标位置，每个目标位置取 K=max_offset+1 个历史来源位置。
+            # 这样每层 Python 循环大约是 ceil(T / chunk_size)，例如 T=3071, chunk_size=256 时约 13 次。
+            chunk_size = 256
+            offsets = torch.arange(max_offset + 1, device=x.device)  # [K]，K=max_offset+1
+
+            for start in range(0, T, chunk_size):
+                end = min(start + chunk_size, T)
+
+                # target_positions: [C]，当前 chunk 内的目标位置 t。
+                # offsets: [K]，每个目标位置往前看的距离 0..W。
+                # source_positions: [C, K]，其中 source_positions[c, k] = t_c - offset_k。
+                target_positions = torch.arange(start, end, device=x.device)
+                source_positions = target_positions.unsqueeze(1) - offsets.unsqueeze(0)
+
+                # valid: [C, K]。序列开头附近会出现 s<0，这些来源位置是无效的，后面 correction 置 0。
+                valid = source_positions >= 0
+                source_positions = source_positions.clamp_min(0)
+
+                # kv_source / expk_source: [B, C, K, D]
+                # C 是当前 chunk 的目标位置数，K 是每个目标位置的局部窗口来源数。
+                # 例：T=6, W=2, chunk t=0..5 时，source_positions 是：
+                # t=0: [0, 0, 0]，其中后两个是无效位置；
+                # t=1: [1, 0, 0]，其中最后一个是无效位置；
+                # t=2: [2, 1, 0]，三个都有效。
+                kv_source = kv[:, source_positions, :]
+                expk_source = exp_k[:, source_positions, :]
 
                 if self.use_low_rank_bias:
                     # 论文公式 7: w_{t,s} = u_t^T v'_s。
-                    # target_bias: [source_length, R]，对应 t=offset..T-1。
-                    # source_bias: [source_length, R]，对应 s=0..T-offset-1。
-                    target_bias = self.position_u[offset:T].float()
-                    source_bias = self.position_v[:source_length].float()
-                    # 逐元素乘后仍是 [source_length, R]，sum(dim=-1) 后得到当前对角线上的 bias:
-                    # bias[i] = w_{t=i+offset, s=i}，形状 [source_length]。
-                    bias = (target_bias * source_bias).sum(dim=-1)
+                    # target_bias: [C, R] -> unsqueeze 后 [C, 1, R]。
+                    # source_bias: [C, K, R]。
+                    # 两者相乘并在 R 维求和后得到 bias: [C, K]。
+                    target_bias = self.position_u[target_positions].float()
+                    source_bias = self.position_v[source_positions].float()
+                    bias = (
+                        target_bias.unsqueeze(1) * source_bias
+                    ).sum(dim=-1)
                 else:
-                    # 从完整位置参数表里取 w_{t,t-offset} 这一条对角线。
-                    target_positions = torch.arange(offset, T, device=x.device)
-                    source_positions = target_positions - offset
-                    # target_positions/source_positions: [source_length]
-                    # bias: [source_length]，对应这一条对角线上的 w_{t,s}。
-                    bias = self.position_bias[target_positions, source_positions].float()
+                    # 从完整位置参数表中一次性取出当前 chunk 的局部窗口 bias。
+                    # target_positions.unsqueeze(1): [C, 1]，source_positions: [C, K]。
+                    # 广播索引后得到 bias: [C, K]，即所有 w_{t,s}。
+                    bias = self.position_bias[
+                        target_positions.unsqueeze(1),
+                        source_positions,
+                    ].float()
 
                 # 全局项已经有 exp(k_s)。局部窗口内应该从 exp(k_s) 变成 exp(k_s + w_{t,s})，
                 # 所以只需要额外加 exp(k_s) * (exp(w_{t,s}) - 1)。
-                # correction: [1, source_length, 1]，可以广播到 [B, source_length, D]。
-                correction = torch.exp(bias).view(1, source_length, 1) - 1.0
-                # 左边 local_numerator[:, offset:, :]: [B, source_length, D]，对应目标位置 t=offset..T-1。
-                # 右边 kv[:, :source_length, :]: [B, source_length, D]，对应来源位置 s=0..T-offset-1。
-                # 因为这条对角线满足 t=s+offset，所以两边第二维一一对齐。
-                local_numerator[:, offset:, :] = (
-                    local_numerator[:, offset:, :]
-                    + correction * kv[:, :source_length, :]
-                )
-                # local_denominator 的形状变化同上，只是这里累加的是权重 exp(k_s)，不乘 v_s。
-                local_denominator[:, offset:, :] = (
-                    local_denominator[:, offset:, :]
-                    + correction * exp_k[:, :source_length, :]
-                )
+                # 无效来源位置 s<0 的 correction 设为 0，避免序列开头错误累加。
+                correction = torch.exp(bias) - 1.0  # [C, K]
+                correction = correction.masked_fill(~valid, 0.0)
+                correction = correction.unsqueeze(0).unsqueeze(-1)  # [1, C, K, 1]
+
+                # correction * kv_source: [B, C, K, D]
+                # sum(dim=2) 沿局部窗口 K 求和，得到当前 chunk 的局部修正 [B, C, D]。
+                local_numerator[:, start:end, :] = (
+                    correction * kv_source
+                ).sum(dim=2)
+                local_denominator[:, start:end, :] = (
+                    correction * expk_source
+                ).sum(dim=2)
 
             # numerator/denominator: [B, T, D]
             # 这两行把“全局历史基础项”和“局部位置偏置修正项”加起来。
