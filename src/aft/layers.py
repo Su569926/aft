@@ -172,7 +172,9 @@ class AFTLocal(nn.Module):
         if self.causal:
             # causal mask 用在自回归任务中，保证位置 t 不能看未来位置 s > t。
             causal_mask = source_positions <= target_positions
-            bias = bias.masked_fill(~causal_mask, -1e9)
+            # AMP = Automatic Mixed Precision，自动混合精度；autocast 下 bias 可能是 float16。
+            # float16 不能表示 -1e9，所以这里用 -1e4：它足够让 exp 权重接近 0，同时不会溢出。
+            bias = bias.masked_fill(~causal_mask, -1e4)
 
         k = k.unsqueeze(1)  # [B, 1, T, D]
         v = v.unsqueeze(1)  # [B, 1, T, D]
