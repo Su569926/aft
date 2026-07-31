@@ -24,7 +24,7 @@ def parse_args():
 
 def load_id_to_wnid(devkit_path):
     with tempfile.TemporaryDirectory() as tmpdir:
-        tempdir = Path(tmpdir)
+        tmpdir = Path(tmpdir)
 
         with tarfile.open(devkit_path, "r:gz") as tar:
             tar.extractall(tmpdir)
