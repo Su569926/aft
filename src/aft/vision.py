@@ -80,8 +80,16 @@ class AFTConv2D(nn.Module):
         # numerator   = sum(exp(k) * v)
         # denominator = sum(exp(k))
         # 这里先保留逐位置的 exp(k)*v，后面分别做全局求和和局部卷积修正。
-        exp_k = torch.exp(k)
-        kv = exp_k * v
+        #
+        # ImageNet + AMP 时，k 如果直接做 exp(k) 容易在 float16 下溢出成 inf，
+        # 之后 inf / inf 会变成 nan。这里转成 float32，并沿 patch/token 维 N 减最大值。
+        # 对同一个 batch、同一个通道，所有位置同时减去同一个常数，不改变加权平均比例：
+        # exp(k_s - m) / sum_s exp(k_s - m) 与 exp(k_s) / sum_s exp(k_s) 等价。
+        k_float = k.float()
+        v_float = v.float()
+        k_float = k_float - k_float.amax(dim=1, keepdim=True)
+        exp_k = torch.exp(k_float)
+        kv = exp_k * v_float
         normalizer = exp_k
 
         # 全局项：沿 N 这个 patch/token 维度求和。
@@ -134,7 +142,8 @@ class AFTConv2D(nn.Module):
         denominator = local_denominator + global_denominator
 
         # sigmoid(q) 是当前位置门控；out_proj 再混合特征维度；dropout 用于正则化。
-        y = torch.sigmoid(q) * numerator / (denominator + 1e-6)
+        y = torch.sigmoid(q.float()) * numerator / (denominator + 1e-6)
+        y = y.to(q.dtype)
         y = self.out_proj(y)
         y = self.dropout(y)
         return y
