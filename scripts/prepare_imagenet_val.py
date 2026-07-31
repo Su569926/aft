@@ -68,7 +68,7 @@ def main():
     args = parse_args()
 
     devkit_path = Path(args.devkit)
-    val_dir = Path(args.cal_dir)
+    val_dir = Path(args.val_dir)
 
     id_to_wnid = load_id_to_wnid(devkit_path)
     labels = load_val_labels(devkit_path)
