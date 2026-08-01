@@ -113,7 +113,12 @@ class AFTConv2D(nn.Module):
 
         position_bias = self.position_gain * normalized_bias + self.position_offset
 
-        conv_weight = torch.exp(position_bias) - 1.0
+        # 防止 exp(position_bias) 在 ImageNet 大模型训练中数值爆炸。tanh 是平滑约束，范围约为 [-limit, limit]，比 clamp 更适合训练。
+        bias_limit = 3.0
+        position_bias = bias_limit * torch.tanh(position_bias / bias_limit)
+
+        conv_weight = torch.exp(position_bias.float()) - 1.0
+        conv_weight = conv_weight.to(kv_2d.dtype)
 
         # 局部分子项：在二维 patch 网格上，用 K x K 邻域补充局部位置偏置。
         # groups=D 表示每个通道单独卷积，输入输出仍是 [B, D, grid, grid]。

@@ -38,6 +38,7 @@ def parse_args():
     parser.add_argument("--warmup-epochs", type=int, default=5)#前几个epoch现性升学习率
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=8) #用多少个 CPU 子进程在后台加载图片、做 transforms、拼 batch
+    parser.add_argument("--grad-clip", type=float, default=0.0)
 
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--grad-accum-steps", type=int, default=1)
@@ -341,7 +342,7 @@ def evaluate(model, val_loader, criterion, device, amp, world_size):
 
     return val_loss, top1, top5
 
-def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, amp, grad_accum_steps,):
+def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, amp, grad_accum_steps, grad_clip):
     # 训练模式会启用 Dropout 等训练期行为。
     model.train()
 
@@ -393,9 +394,14 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, a
         if should_step:
             # 累积够 grad_accum_steps 个 micro batch 后，才真正更新一次参数。
             if amp:
+                scaler.unscale_(optimizer)
+                if grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                if grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
 
             optimizer.zero_grad()
@@ -459,6 +465,7 @@ def main():
         print("val samples:", len(val_loader.dataset))
         print("effective batch size:", args.batch_size * world_size * args.grad_accum_steps)
         print("use_position_embedding:", args.use_position_embedding)
+        print("grad_clip:", args.grad_clip)
         print("start epoch:", start_epoch)
 
     if is_main_process and start_epoch == 0:
@@ -486,6 +493,7 @@ def main():
             device=device,
             amp=args.amp,
             grad_accum_steps=args.grad_accum_steps,
+            grad_clip=args.grad_clip,
         )
 
         should_eval = (epoch + 1) % args.eval_interval == 0
