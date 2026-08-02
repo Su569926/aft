@@ -52,7 +52,18 @@ def parse_args():
     parser.add_argument("--output-path", type=str, default="outputs/aft_imagenet.pt")
     parser.add_argument("--log-path", type=str, default="outputs/train_imagenet_log.csv")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.mixup_alpha < 0.0:
+        parser.error("--mixup-alpha must be >= 0")
+    if args.cutmix_alpha < 0.0:
+        parser.error("--cutmix-alpha must be >= 0")
+    if not 0.0 <= args.mix_prob <= 1.0:
+        parser.error("--mix-prob must be between 0 and 1")
+    if args.grad_accum_steps < 1:
+        parser.error("--grad-accum-steps must be >= 1")
+
+    return args
 
 def setup_ddp():
     # DDP = DistributedDataParallel，中文常叫“分布式数据并行”。
@@ -557,6 +568,9 @@ def main():
         print("effective batch size:", args.batch_size * world_size * args.grad_accum_steps)
         print("use_position_embedding:", args.use_position_embedding)
         print("grad_clip:", args.grad_clip)
+        print("mixup_alpha:", args.mixup_alpha)
+        print("cutmix_alpha:", args.cutmix_alpha)
+        print("mix_prob:", args.mix_prob)
         print("start epoch:", start_epoch)
 
     if is_main_process and start_epoch == 0:
