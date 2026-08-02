@@ -43,6 +43,10 @@ def parse_args():
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--grad-accum-steps", type=int, default=1)
 
+    parser.add_argument("--mixup-alpha", type=float, default=0.0)
+    parser.add_argument("--cutmix-alpha", type=float, default=0.0)
+    parser.add_argument("--mix-prob", type=float, default=0.0)
+
     parser.add_argument("--eval-interval", type=int, default=1)
     parser.add_argument("--save-interval", type=int, default=1)
     parser.add_argument("--output-path", type=str, default="outputs/aft_imagenet.pt")
@@ -99,11 +103,17 @@ def build_dataloaders(args, rank, world_size):
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(args.image_size), #训练集随机裁剪成 224 x 224，这是 ImageNet 常用训练增强
         transforms.RandomHorizontalFlip(), #随机左右翻转图片，提高泛化
+        transforms.RandAugment(num_ops=2, magnitude=9),
         transforms.ToTensor(), #[H, W, C] -> [C, H, W]，并且像素值从 0~255 变成 0~1
         transforms.Normalize(
             mean=(0.485, 0.456, 0.406),
             std=(0.229, 0.224, 0.225)
-        ), #标准均值和方差归一化
+        ), #标准均值和方差归一化、
+        transforms.RandomErasing(
+            p=0.25,
+            scale=(0.02, 0.33),
+            ratio=(0.3, 3.3)
+        )
     ])
 
     # 验证 transform 不带随机性：保证每次评估结果可比较。
@@ -183,7 +193,7 @@ def build_model_and_train_state(args, device):
     model = model.to(device)
 
     # CrossEntropyLoss 接收 logits [B, num_classes] 和整数标签 [B]。
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     # AdamW 是带 decoupled weight decay 的 Adam，ImageNet/Transformer 训练常用。
     optimizer = torch.optim.AdamW(
@@ -293,6 +303,64 @@ def write_log(log_path, epoch, lr, train_loss, val_loss, top1, top5, is_main_pro
     with log_path.open("a", encoding="utf-8") as f:
         f.write(f"{epoch},{lr},{train_loss},{val_loss},{top1},{top5}\n")
 
+def sample_beta(alpha, device):
+    alpha_tensor = torch.tensor(alpha, device=device)
+    beta = torch.distributions.Beta(alpha_tensor, alpha_tensor)
+    return float(beta.sample().item())
+
+def rand_bbox(images, lam):
+    _, _, height, width = images.shape
+
+    cut_ratio = math.sqrt(1.0 - lam)
+    cut_w = int(width * cut_ratio)
+    cut_h = int(height * cut_ratio)
+
+    cx = int(torch.randint(width, (1,), device=images.device).item())
+    cy = int(torch.randint(height, (1,), device=images.device).item())
+
+    x1 = max(cx - cut_w // 2, 0)
+    y1 = max(cy - cut_h // 2, 0)
+    x2 = min(cx + cut_w // 2, width)
+    y2 = min(cy + cut_h // 2, height)
+
+    return x1, y1, x2, y2
+
+def apply_mixup_cutmix(images, labels, mixup_alpha, cutmix_alpha, mix_prob):
+    if mix_prob <= 0.0:
+        return images, labels, labels, 1.0
+
+    if mixup_alpha <= 0.0 and cutmix_alpha <= 0.0:
+        return images, labels, labels, 1.0
+
+    if float(torch.rand((), device=images.device).item()) > mix_prob:
+        return images, labels, labels, 1.0
+
+    batch_size = images.shape[0]
+    perm = torch.randperm(batch_size, device=images.device)
+
+    use_cutmix = cutmix_alpha > 0.0
+    if mixup_alpha > 0.0 and cutmix_alpha > 0.0:
+        use_cutmix = bool(torch.rand((), device=images.device).item() < 0.5)
+
+    if use_cutmix:
+        lam = sample_beta(cutmix_alpha, images.device)
+        x1, y1, x2, y2 = rand_bbox(images, lam)
+
+        mixed_images = images.clone()
+        mixed_images[:, :, y1:y2, x1:x2] = images[perm, :, y1:y2, x1:x2]
+
+        area = (x2 - x1) * (y2 - y1)
+        total_area = images.shape[2] * images.shape[3]
+        lam = 1.0 - area / total_area
+    else:
+        lam = sample_beta(mixup_alpha, images.device)
+        mixed_images = lam * images + (1.0 - lam) * images[perm]
+
+    labels_a = labels
+    labels_b = labels[perm]
+
+    return mixed_images, labels_a, labels_b, lam
+
 @torch.no_grad()
 def evaluate(model, val_loader, criterion, device, amp, world_size):
     # 验证阶段不更新参数，所以关闭梯度记录并切到 eval 模式。
@@ -342,7 +410,20 @@ def evaluate(model, val_loader, criterion, device, amp, world_size):
 
     return val_loss, top1, top5
 
-def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, amp, grad_accum_steps, grad_clip):
+def train_one_epoch(
+        model,
+        train_loader,
+        criterion,
+        optimizer,
+        scaler,
+        device,
+        amp,
+        grad_accum_steps,
+        grad_clip,
+        mixup_alpha,
+        cutmix_alpha,
+        mix_prob,
+):
     # 训练模式会启用 Dropout 等训练期行为。
     model.train()
 
@@ -375,10 +456,20 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, a
             sync_context = nullcontext()
 
         with sync_context:
+            mixed_images, labels_a, labels_b, lam = apply_mixup_cutmix(
+                images=images,
+                labels=labels,
+                mixup_alpha=mixup_alpha,
+                cutmix_alpha=cutmix_alpha,
+                mix_prob=mix_prob
+            )
             with torch.amp.autocast("cuda", enabled=amp):
                 # 模型输出 logits: [B, num_classes]。
-                logits = model(images)
-                loss = criterion(logits, labels)
+                logits = model(mixed_images)
+                loss = (
+                    lam * criterion(logits, labels_a)
+                    + (1.0 - lam) * criterion(logits, labels_b)
+                )
                 # 梯度累积时，每个 micro batch 的 loss 要除以累积步数；
                 # 否则累积后的梯度会被放大。最后不足一组时，用当前组真实步数。
                 loss_for_backward = loss / current_accum_steps #累计了多个micro batch再更新参数
@@ -494,6 +585,9 @@ def main():
             amp=args.amp,
             grad_accum_steps=args.grad_accum_steps,
             grad_clip=args.grad_clip,
+            mixup_alpha=args.mixup_alpha,
+            cutmix_alpha=args.cutmix_alpha,
+            mix_prob=args.mix_prob,
         )
 
         should_eval = (epoch + 1) % args.eval_interval == 0
