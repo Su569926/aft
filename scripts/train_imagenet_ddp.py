@@ -316,6 +316,8 @@ def write_log(
         optimizer_steps_per_sec,
         images_per_sec,
         images_per_sec_per_gpu,
+        max_memory_allocated_gb_per_gpu,
+        max_memory_reserved_gb_per_gpu,
         is_main_process,
 ):
     # CSV 日志同样只让 rank 0 写，避免重复行。
@@ -329,7 +331,9 @@ def write_log(
         f.write(
             f"{epoch},{lr},{train_loss},{val_loss},{top1},{top5},"
             f"{train_seconds},{optimizer_steps_per_sec},"
-            f"{images_per_sec},{images_per_sec_per_gpu}\n"
+            f"{images_per_sec},{images_per_sec_per_gpu},"
+            f"{max_memory_allocated_gb_per_gpu},"
+            f"{max_memory_reserved_gb_per_gpu}\n"
         )
 
 def sample_beta(alpha, device):
@@ -465,6 +469,7 @@ def train_one_epoch(
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
     train_start = time.perf_counter()
 
     for step, (images, labels) in enumerate(train_loader): #step是这个epoch的第几个batch
@@ -538,6 +543,11 @@ def train_one_epoch(
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     local_train_seconds = time.perf_counter() - train_start
+    local_max_allocated_gb = 0.0
+    local_max_reserved_gb = 0.0
+    if device.type == "cuda":
+        local_max_allocated_gb = torch.cuda.max_memory_allocated(device) / 1024 ** 3
+        local_max_reserved_gb = torch.cuda.max_memory_reserved(device) / 1024 ** 3
 
     stats = torch.tensor(
         [total_loss, total_samples],
@@ -549,11 +559,18 @@ def train_one_epoch(
         device=device,
         dtype=torch.float64,
     )
+    memory_tensor = torch.tensor(
+        [local_max_allocated_gb, local_max_reserved_gb],
+        device=device,
+        dtype=torch.float64,
+    )
 
     # 同步所有 GPU 的 train_loss 统计量，rank 0 打印的是全局平均训练 loss。
     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
     # throughput 由最慢 rank 决定，因此用 MAX。
     dist.all_reduce(seconds_tensor, op=dist.ReduceOp.MAX)
+    # 显存记录每个训练 epoch 内的最大单卡峰值。
+    dist.all_reduce(memory_tensor, op=dist.ReduceOp.MAX)
 
     train_loss = stats[0].item() / stats[1].item()
     train_seconds = seconds_tensor.item()
@@ -561,6 +578,8 @@ def train_one_epoch(
     optimizer_steps_per_sec = optimizer_steps / train_seconds
     images_per_sec = train_samples / train_seconds
     images_per_sec_per_gpu = images_per_sec / dist.get_world_size()
+    max_memory_allocated_gb_per_gpu = memory_tensor[0].item()
+    max_memory_reserved_gb_per_gpu = memory_tensor[1].item()
 
     return (
         train_loss,
@@ -568,6 +587,8 @@ def train_one_epoch(
         optimizer_steps_per_sec,
         images_per_sec,
         images_per_sec_per_gpu,
+        max_memory_allocated_gb_per_gpu,
+        max_memory_reserved_gb_per_gpu,
     )
 
 def main():
@@ -624,7 +645,9 @@ def main():
         log_path.write_text(
             "epoch,lr,train_loss,val_loss,top1,top5,"
             "train_seconds,optimizer_steps_per_sec,"
-            "images_per_sec,images_per_sec_per_gpu\n",
+            "images_per_sec,images_per_sec_per_gpu,"
+            "max_memory_allocated_gb_per_gpu,"
+            "max_memory_reserved_gb_per_gpu\n",
             encoding="utf-8",
         )
 
@@ -642,6 +665,8 @@ def main():
             optimizer_steps_per_sec,
             images_per_sec,
             images_per_sec_per_gpu,
+            max_memory_allocated_gb_per_gpu,
+            max_memory_reserved_gb_per_gpu,
         ) = train_one_epoch(
             model=model,
             train_loader=train_loader,
@@ -695,6 +720,10 @@ def main():
                 images_per_sec,
                 "images/s/gpu:",
                 images_per_sec_per_gpu,
+                "max allocated GB/gpu:",
+                max_memory_allocated_gb_per_gpu,
+                "max reserved GB/gpu:",
+                max_memory_reserved_gb_per_gpu,
             )
 
             write_log(
@@ -709,6 +738,8 @@ def main():
                 optimizer_steps_per_sec=optimizer_steps_per_sec,
                 images_per_sec=images_per_sec,
                 images_per_sec_per_gpu=images_per_sec_per_gpu,
+                max_memory_allocated_gb_per_gpu=max_memory_allocated_gb_per_gpu,
+                max_memory_reserved_gb_per_gpu=max_memory_reserved_gb_per_gpu,
                 is_main_process=is_main_process,
             )
 

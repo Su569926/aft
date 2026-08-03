@@ -248,7 +248,9 @@ if is_main_process and start_step == 0:
         "step,lr,train_loss,val_loss,val_bpd,"
         "step_seconds,optimizer_steps_per_sec,"
         "micro_batches_per_sec,images_per_sec,images_per_sec_per_gpu,"
-        "tokens_per_sec,tokens_per_sec_per_gpu\n",
+        "tokens_per_sec,tokens_per_sec_per_gpu,"
+        "max_memory_allocated_gb_per_gpu,"
+        "max_memory_reserved_gb_per_gpu\n",
         encoding="utf-8",
     )
 
@@ -330,6 +332,8 @@ def write_log(
         images_per_sec_per_gpu,
         tokens_per_sec,
         tokens_per_sec_per_gpu,
+        max_memory_allocated_gb_per_gpu,
+        max_memory_reserved_gb_per_gpu,
 ):
     # 日志同样只让主进程写，避免多进程重复写入。
     if not is_main_process:
@@ -340,7 +344,9 @@ def write_log(
             f"{step_seconds},{optimizer_steps_per_sec},"
             f"{micro_batches_per_sec},{images_per_sec},"
             f"{images_per_sec_per_gpu},{tokens_per_sec},"
-            f"{tokens_per_sec_per_gpu}\n"
+            f"{tokens_per_sec_per_gpu},"
+            f"{max_memory_allocated_gb_per_gpu},"
+            f"{max_memory_reserved_gb_per_gpu}\n"
         )
 
 for step in range(start_step, num_steps):
@@ -349,6 +355,7 @@ for step in range(start_step, num_steps):
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
     step_start = time.perf_counter()
 
     optimizer.zero_grad()
@@ -383,14 +390,27 @@ for step in range(start_step, num_steps):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     local_step_seconds = time.perf_counter() - step_start
+    local_max_allocated_gb = 0.0
+    local_max_reserved_gb = 0.0
+    if device.type == "cuda":
+        local_max_allocated_gb = torch.cuda.max_memory_allocated(device) / 1024 ** 3
+        local_max_reserved_gb = torch.cuda.max_memory_reserved(device) / 1024 ** 3
 
     step_seconds_tensor = torch.tensor(
         local_step_seconds,
         device=device,
         dtype=torch.float64,
     )
+    memory_tensor = torch.tensor(
+        [local_max_allocated_gb, local_max_reserved_gb],
+        device=device,
+        dtype=torch.float64,
+    )
     dist.all_reduce(step_seconds_tensor, op=dist.ReduceOp.MAX)
+    dist.all_reduce(memory_tensor, op=dist.ReduceOp.MAX)
     step_seconds = step_seconds_tensor.item()
+    max_memory_allocated_gb_per_gpu = memory_tensor[0].item()
+    max_memory_reserved_gb_per_gpu = memory_tensor[1].item()
 
     optimizer_steps_per_sec = 1.0 / step_seconds
     micro_batches_per_sec = grad_accum_steps / step_seconds
@@ -429,6 +449,10 @@ for step in range(start_step, num_steps):
                 images_per_sec,
                 "tokens/s:",
                 tokens_per_sec,
+                "max allocated GB/gpu:",
+                max_memory_allocated_gb_per_gpu,
+                "max reserved GB/gpu:",
+                max_memory_reserved_gb_per_gpu,
             )
             write_log(
                 step,
@@ -443,6 +467,8 @@ for step in range(start_step, num_steps):
                 images_per_sec_per_gpu,
                 tokens_per_sec,
                 tokens_per_sec_per_gpu,
+                max_memory_allocated_gb_per_gpu,
+                max_memory_reserved_gb_per_gpu,
             )
 
     if is_main_process and step > 0 and step % save_interval == 0:

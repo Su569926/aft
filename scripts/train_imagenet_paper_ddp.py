@@ -169,7 +169,9 @@ def main():
         log_path.write_text(
             "epoch,lr,train_loss,val_loss,top1,top5,"
             "train_seconds,optimizer_steps_per_sec,"
-            "images_per_sec,images_per_sec_per_gpu\n",
+            "images_per_sec,images_per_sec_per_gpu,"
+            "max_memory_allocated_gb_per_gpu,"
+            "max_memory_reserved_gb_per_gpu\n",
             encoding="utf-8",
         )
 
@@ -184,6 +186,8 @@ def main():
             optimizer_steps_per_sec,
             images_per_sec,
             images_per_sec_per_gpu,
+            max_memory_allocated_gb_per_gpu,
+            max_memory_reserved_gb_per_gpu,
         ) = train_one_epoch(
             model=model,
             train_loader=train_loader,
@@ -236,6 +240,10 @@ def main():
                 images_per_sec,
                 "images/s/gpu:",
                 images_per_sec_per_gpu,
+                "max allocated GB/gpu:",
+                max_memory_allocated_gb_per_gpu,
+                "max reserved GB/gpu:",
+                max_memory_reserved_gb_per_gpu,
             )
 
             write_log(
@@ -250,6 +258,8 @@ def main():
                 optimizer_steps_per_sec=optimizer_steps_per_sec,
                 images_per_sec=images_per_sec,
                 images_per_sec_per_gpu=images_per_sec_per_gpu,
+                max_memory_allocated_gb_per_gpu=max_memory_allocated_gb_per_gpu,
+                max_memory_reserved_gb_per_gpu=max_memory_reserved_gb_per_gpu,
                 is_main_process=is_main_process,
             )
 
