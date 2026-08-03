@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import math
+import time
 
 import argparse
 import torch
@@ -243,7 +244,13 @@ model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 if is_main_process and start_step == 0:
     # 从头训练时创建新日志；resume 时不覆盖旧日志，而是继续追加。
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text("step,lr,train_loss,val_loss,val_bpd\n", encoding="utf-8")
+    log_path.write_text(
+        "step,lr,train_loss,val_loss,val_bpd,"
+        "step_seconds,optimizer_steps_per_sec,"
+        "micro_batches_per_sec,images_per_sec,images_per_sec_per_gpu,"
+        "tokens_per_sec,tokens_per_sec_per_gpu\n",
+        encoding="utf-8",
+    )
 
 @torch.no_grad()
 def estimate_loss(data, num_batches=20):
@@ -310,16 +317,39 @@ def save_checkpoint(step):
         output_path,
     )
 
-def write_log(step, lr, train_loss, val_loss, val_bpd):
+def write_log(
+        step,
+        lr,
+        train_loss,
+        val_loss,
+        val_bpd,
+        step_seconds,
+        optimizer_steps_per_sec,
+        micro_batches_per_sec,
+        images_per_sec,
+        images_per_sec_per_gpu,
+        tokens_per_sec,
+        tokens_per_sec_per_gpu,
+):
     # 日志同样只让主进程写，避免多进程重复写入。
     if not is_main_process:
         return
     with log_path.open("a", encoding="utf-8") as f:
-        f.write(f"{step},{lr},{train_loss},{val_loss},{val_bpd}\n")
+        f.write(
+            f"{step},{lr},{train_loss},{val_loss},{val_bpd},"
+            f"{step_seconds},{optimizer_steps_per_sec},"
+            f"{micro_batches_per_sec},{images_per_sec},"
+            f"{images_per_sec_per_gpu},{tokens_per_sec},"
+            f"{tokens_per_sec_per_gpu}\n"
+        )
 
 for step in range(start_step, num_steps):
     lr = get_learning_rate(step)
     set_learning_rate(optimizer, lr)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    step_start = time.perf_counter()
 
     optimizer.zero_grad()
     total_loss = 0.0
@@ -350,6 +380,26 @@ for step in range(start_step, num_steps):
     else:
         optimizer.step()
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    local_step_seconds = time.perf_counter() - step_start
+
+    step_seconds_tensor = torch.tensor(
+        local_step_seconds,
+        device=device,
+        dtype=torch.float64,
+    )
+    dist.all_reduce(step_seconds_tensor, op=dist.ReduceOp.MAX)
+    step_seconds = step_seconds_tensor.item()
+
+    optimizer_steps_per_sec = 1.0 / step_seconds
+    micro_batches_per_sec = grad_accum_steps / step_seconds
+    global_images_per_step = batch_size * world_size * grad_accum_steps
+    images_per_sec = global_images_per_step / step_seconds
+    images_per_sec_per_gpu = images_per_sec / world_size
+    tokens_per_sec = images_per_sec * seq_len
+    tokens_per_sec_per_gpu = tokens_per_sec / world_size
+
     train_loss = total_loss
 
     if step % eval_interval == 0:
@@ -371,8 +421,29 @@ for step in range(start_step, num_steps):
                 val_loss,
                 "val bpd:",
                 val_bpd,
+                "step seconds:",
+                step_seconds,
+                "optim steps/s:",
+                optimizer_steps_per_sec,
+                "images/s:",
+                images_per_sec,
+                "tokens/s:",
+                tokens_per_sec,
             )
-            write_log(step, lr, train_loss, val_loss, val_bpd)
+            write_log(
+                step,
+                lr,
+                train_loss,
+                val_loss,
+                val_bpd,
+                step_seconds,
+                optimizer_steps_per_sec,
+                micro_batches_per_sec,
+                images_per_sec,
+                images_per_sec_per_gpu,
+                tokens_per_sec,
+                tokens_per_sec_per_gpu,
+            )
 
     if is_main_process and step > 0 and step % save_interval == 0:
         save_checkpoint(step)

@@ -3,6 +3,7 @@ import os
 import argparse
 from contextlib import nullcontext
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -303,7 +304,20 @@ def load_checkpoint(path, model, optimizer, scaler, device):
 
     return start_epoch
 
-def write_log(log_path, epoch, lr, train_loss, val_loss, top1, top5, is_main_process):
+def write_log(
+        log_path,
+        epoch,
+        lr,
+        train_loss,
+        val_loss,
+        top1,
+        top5,
+        train_seconds,
+        optimizer_steps_per_sec,
+        images_per_sec,
+        images_per_sec_per_gpu,
+        is_main_process,
+):
     # CSV 日志同样只让 rank 0 写，避免重复行。
     if not is_main_process:
         return
@@ -312,7 +326,11 @@ def write_log(log_path, epoch, lr, train_loss, val_loss, top1, top5, is_main_pro
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     with log_path.open("a", encoding="utf-8") as f:
-        f.write(f"{epoch},{lr},{train_loss},{val_loss},{top1},{top5}\n")
+        f.write(
+            f"{epoch},{lr},{train_loss},{val_loss},{top1},{top5},"
+            f"{train_seconds},{optimizer_steps_per_sec},"
+            f"{images_per_sec},{images_per_sec_per_gpu}\n"
+        )
 
 def sample_beta(alpha, device):
     alpha_tensor = torch.tensor(alpha, device=device)
@@ -443,6 +461,11 @@ def train_one_epoch(
     total_loss = 0.0
     total_samples = 0
     num_batches = len(train_loader)
+    optimizer_steps = math.ceil(num_batches / grad_accum_steps)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    train_start = time.perf_counter()
 
     for step, (images, labels) in enumerate(train_loader): #step是这个epoch的第几个batch
         # train_loader 每次吐出一个 batch：
@@ -512,18 +535,40 @@ def train_one_epoch(
         total_loss += loss.item() * batch_size
         total_samples += batch_size
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    local_train_seconds = time.perf_counter() - train_start
+
     stats = torch.tensor(
         [total_loss, total_samples],
+        device=device,
+        dtype=torch.float64,
+    )
+    seconds_tensor = torch.tensor(
+        local_train_seconds,
         device=device,
         dtype=torch.float64,
     )
 
     # 同步所有 GPU 的 train_loss 统计量，rank 0 打印的是全局平均训练 loss。
     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    # throughput 由最慢 rank 决定，因此用 MAX。
+    dist.all_reduce(seconds_tensor, op=dist.ReduceOp.MAX)
 
     train_loss = stats[0].item() / stats[1].item()
+    train_seconds = seconds_tensor.item()
+    train_samples = stats[1].item()
+    optimizer_steps_per_sec = optimizer_steps / train_seconds
+    images_per_sec = train_samples / train_seconds
+    images_per_sec_per_gpu = images_per_sec / dist.get_world_size()
 
-    return train_loss
+    return (
+        train_loss,
+        train_seconds,
+        optimizer_steps_per_sec,
+        images_per_sec,
+        images_per_sec_per_gpu,
+    )
 
 def main():
     args = parse_args()
@@ -577,7 +622,9 @@ def main():
         # 从头训练时创建新日志；resume 时继续追加，避免覆盖旧记录。
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(
-            "epoch,lr,train_loss,val_loss,top1,top5\n",
+            "epoch,lr,train_loss,val_loss,top1,top5,"
+            "train_seconds,optimizer_steps_per_sec,"
+            "images_per_sec,images_per_sec_per_gpu\n",
             encoding="utf-8",
         )
 
@@ -589,7 +636,13 @@ def main():
         # 才能让每个 epoch 使用不同的 shuffle 顺序。
         train_sampler.set_epoch(epoch)
 
-        train_loss = train_one_epoch(
+        (
+            train_loss,
+            train_seconds,
+            optimizer_steps_per_sec,
+            images_per_sec,
+            images_per_sec_per_gpu,
+        ) = train_one_epoch(
             model=model,
             train_loader=train_loader,
             criterion=criterion,
@@ -634,6 +687,14 @@ def main():
                 top1,
                 "top5:",
                 top5,
+                "train seconds:",
+                train_seconds,
+                "optim steps/s:",
+                optimizer_steps_per_sec,
+                "images/s:",
+                images_per_sec,
+                "images/s/gpu:",
+                images_per_sec_per_gpu,
             )
 
             write_log(
@@ -644,6 +705,10 @@ def main():
                 val_loss=val_loss,
                 top1=top1,
                 top5=top5,
+                train_seconds=train_seconds,
+                optimizer_steps_per_sec=optimizer_steps_per_sec,
+                images_per_sec=images_per_sec,
+                images_per_sec_per_gpu=images_per_sec_per_gpu,
                 is_main_process=is_main_process,
             )
 
